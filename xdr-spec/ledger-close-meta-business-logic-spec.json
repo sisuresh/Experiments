@@ -1,0 +1,561 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stellar.org/schema/ledger-close-meta-business-logic/v25.0.0/LedgerCloseMeta.json",
+  "title": "LedgerCloseMeta Business Logic Specification",
+  "description": "This specification defines the business logic constraints and invariants for LedgerCloseMeta, used to validate and generate test XDR for downstream consumers.",
+  "type": "object",
+  "definitions": {
+    "versionConstraints": {
+      "description": "Determines which LedgerCloseMeta version to use based on protocol version",
+      "type": "object",
+      "properties": {
+        "v0": {
+          "description": "Used for protocol versions < 20 (pre-Soroban)",
+          "protocolVersionRange": {"min": 1, "max": 19}
+        },
+        "v1": {
+          "description": "Used for protocol versions 20-22 (Soroban, pre-parallel)",
+          "protocolVersionRange": {"min": 20, "max": 22}
+        },
+        "v2": {
+          "description": "Used for protocol versions >= 23 (parallel Soroban phase)",
+          "protocolVersionRange": {"min": 23}
+        }
+      }
+    },
+
+    "ledgerHeaderInvariants": {
+      "description": "Invariants for the ledgerHeader field",
+      "type": "object",
+      "properties": {
+        "hash": {
+          "description": "SHA256 hash of the LedgerHeader XDR",
+          "type": "string",
+          "format": "hex",
+          "minLength": 64,
+          "maxLength": 64,
+          "invariants": [
+            "hash == SHA256(header)"
+          ]
+        },
+        "header": {
+          "type": "object",
+          "properties": {
+            "ledgerVersion": {
+              "description": "Protocol version of the ledger",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 25,
+              "invariants": [
+                "ledgerVersion >= previousLedger.ledgerVersion",
+                "If upgrade applied: ledgerVersion may increase by 1 from previousLedger"
+              ]
+            },
+            "previousLedgerHash": {
+              "description": "Hash of the previous ledger header",
+              "type": "string",
+              "format": "hex",
+              "minLength": 64,
+              "maxLength": 64,
+              "invariants": [
+                "previousLedgerHash == txSet.previousLedgerHash (for v1/v2)",
+                "previousLedgerHash == txSet.previousLedgerHash (for v0)",
+                "previousLedgerHash == previousLedger.hash"
+              ]
+            },
+            "scpValue": {
+              "type": "object",
+              "properties": {
+                "txSetHash": {
+                  "description": "Hash of the transaction set",
+                  "invariants": [
+                    "txSetHash == SHA256(GeneralizedTransactionSet) for v1/v2",
+                    "txSetHash == SHA256(TransactionSet) for v0"
+                  ]
+                },
+                "closeTime": {
+                  "description": "Network close time (Unix timestamp)",
+                  "type": "string",
+                  "invariants": [
+                    "closeTime > previousLedger.closeTime",
+                    "closeTime is reasonably close to wall-clock time"
+                  ]
+                },
+                "upgrades": {
+                  "description": "List of upgrades to apply",
+                  "type": "array",
+                  "maxItems": 6,
+                  "invariants": [
+                    "Each upgrade is a valid encoded LedgerUpgrade",
+                    "Upgrades are sorted by LedgerUpgradeType",
+                    "At most one entry per LedgerUpgradeType"
+                  ]
+                }
+              }
+            },
+            "txSetResultHash": {
+              "description": "Hash of the TransactionResultSet",
+              "invariants": [
+                "txSetResultHash == SHA256(TransactionResultSet)",
+                "TransactionResultSet.results corresponds 1:1 with txProcessing entries",
+                "Order matches hash order of transactions in txSet"
+              ]
+            },
+            "ledgerSeq": {
+              "description": "Sequence number of this ledger",
+              "type": "integer",
+              "minimum": 1,
+              "invariants": [
+                "ledgerSeq == previousLedger.ledgerSeq + 1"
+              ]
+            },
+            "totalCoins": {
+              "description": "Total stroops in existence",
+              "type": "string",
+              "invariants": [
+                "totalCoins == previousLedger.totalCoins + minted - burned",
+                "Minting only happens during inflation (deprecated)",
+                "Burning happens from fees and failed operations",
+                "totalCoins <= 1000000000000000000 (100 billion XLM)"
+              ]
+            },
+            "feePool": {
+              "description": "Fees burned since last inflation",
+              "type": "string",
+              "invariants": [
+                "feePool >= 0",
+                "feePool increases by sum of all feeCharged in this ledger"
+              ]
+            },
+            "baseFee": {
+              "description": "Base fee per operation in stroops",
+              "type": "integer",
+              "minimum": 1,
+              "invariants": [
+                "Can only change via LEDGER_UPGRADE_BASE_FEE upgrade"
+              ]
+            },
+            "baseReserve": {
+              "description": "Account base reserve in stroops",
+              "type": "integer",
+              "invariants": [
+                "Can only change via LEDGER_UPGRADE_BASE_RESERVE upgrade"
+              ]
+            },
+            "maxTxSetSize": {
+              "description": "Maximum number of operations in a transaction set",
+              "type": "integer",
+              "invariants": [
+                "txSet.totalOps <= maxTxSetSize"
+              ]
+            },
+            "skipList": {
+              "description": "Hashes of previous ledgers for quick traversal",
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "invariants": [
+                "skipList[0] = hash of ledger at (ledgerSeq - ledgerSeq % 50)",
+                "skipList[1] = hash of ledger at (ledgerSeq - ledgerSeq % 5000)",
+                "skipList[2] = hash of ledger at (ledgerSeq - ledgerSeq % 50000)",
+                "skipList[3] = hash of ledger at (ledgerSeq - ledgerSeq % 500000)"
+              ]
+            }
+          }
+        }
+      }
+    },
+
+    "txSetInvariants": {
+      "description": "Invariants for the transaction set",
+      "type": "object",
+      "invariants_v0": {
+        "description": "For LedgerCloseMetaV0 (TransactionSet)",
+        "rules": [
+          "txs are sorted in hash order",
+          "previousLedgerHash matches ledgerHeader.previousLedgerHash",
+          "All transactions are valid for the ledger"
+        ]
+      },
+      "invariants_v1_v2": {
+        "description": "For LedgerCloseMetaV1/V2 (GeneralizedTransactionSet)",
+        "rules": [
+          "previousLedgerHash matches ledgerHeader.previousLedgerHash",
+          "phases[0] is the classic phase (TxSetComponent)",
+          "phases[1] is the Soroban phase (ParallelTxsComponent for v1, v2)",
+          "Classic phase transactions are sorted by hash",
+          "Soroban phase contains parallel execution stages"
+        ]
+      }
+    },
+
+    "txProcessingInvariants": {
+      "description": "Invariants for transaction processing metadata",
+      "type": "object",
+      "properties": {
+        "ordering": {
+          "description": "Transaction ordering in txProcessing",
+          "invariants": [
+            "txProcessing entries are in APPLY order, not hash order",
+            "Classic transactions come before Soroban transactions",
+            "Within phases, order matches the phase's internal ordering"
+          ]
+        },
+        "count": {
+          "description": "Number of txProcessing entries",
+          "invariants": [
+            "txProcessing.length == total number of transactions in txSet",
+            "txProcessing.length == txResultSet.results.length"
+          ]
+        },
+        "feeProcessing": {
+          "description": "Fee deduction metadata (LedgerEntryChanges)",
+          "invariants": [
+            "Always contains STATE change followed by UPDATED change for source account",
+            "Balance decreases by feeCharged amount",
+            "Sequence number increment happens in txChangesBefore, not here",
+            "For fee bump transactions, fee source is debited"
+          ]
+        },
+        "result": {
+          "type": "object",
+          "properties": {
+            "transactionHash": {
+              "invariants": [
+                "For regular tx: hash of TransactionSignaturePayload",
+                "For fee bump inner tx: hash of inner TransactionSignaturePayload",
+                "Hash is computed over the envelope contents"
+              ]
+            },
+            "feeCharged": {
+              "invariants": [
+                "feeCharged >= baseFee * numOperations",
+                "feeCharged <= tx.fee (declared fee)",
+                "feeCharged reflects actual fee paid"
+              ]
+            }
+          }
+        },
+        "txApplyProcessing": {
+          "description": "Transaction application metadata (TransactionMeta)",
+          "type": "object",
+          "versionSelection": {
+            "v0": "protocol < 10",
+            "v1": "10 <= protocol < 11",
+            "v2": "11 <= protocol < 20",
+            "v3": "20 <= protocol < 23",
+            "v4": "protocol >= 23 (or when EMIT_LEDGER_CLOSE_META_EXT_V1 is set)"
+          },
+          "properties": {
+            "txChangesBefore": {
+              "description": "Changes before operations are applied",
+              "invariants": [
+                "Contains sequence number bump for source account",
+                "STATE entry shows pre-bump state",
+                "UPDATED entry shows post-bump state with new seqNum",
+                "seqLedger and seqTime are updated to current ledger values"
+              ]
+            },
+            "operations": {
+              "description": "Per-operation metadata",
+              "invariants": [
+                "operations.length == transaction.operations.length",
+                "Each operation has associated LedgerEntryChanges",
+                "Changes follow STATE -> (CREATED|UPDATED|REMOVED|RESTORED) pattern",
+                "For Soroban ops (v4): includes ContractEvents"
+              ]
+            },
+            "txChangesAfter": {
+              "description": "Changes after all operations",
+              "invariants": [
+                "Usually empty for most transaction types",
+                "May contain cleanup or finalization changes"
+              ]
+            },
+            "sorobanMeta": {
+              "description": "Soroban-specific metadata (only for InvokeHostFunction/ExtendTTL/RestoreFootprint)",
+              "invariants": [
+                "null for non-Soroban/classic transactions",
+                "NOT null for successful Soroban transactions (InvokeHostFunction, ExtendTTL, RestoreFootprint)",
+                "For v3: contains events, returnValue, diagnosticEvents",
+                "For v4 (SorobanTransactionMetaV2): returnValue is null for failed txs, or an SCVal for successful txs",
+                "events contains only CONTRACT type events",
+                "diagnosticEvents contains all diagnostic info including failed calls"
+              ],
+              "v4Structure": {
+                "ext.v1.totalNonRefundableResourceFeeCharged": "Fee portion that cannot be refunded",
+                "ext.v1.totalRefundableResourceFeeCharged": "Fee portion that can be refunded",
+                "ext.v1.rentFeeCharged": "Rent/TTL extension fees charged",
+                "returnValue": "SCVal returned by contract invocation (e.g. 'void' for no return value), or null for failed transactions"
+              }
+            },
+            "events": {
+              "description": "Transaction-level events (v4 only)",
+              "invariants": [
+                "Classic transactions: exactly 1 event with stage='before_all_txs' (fee charge)",
+                "Soroban transactions: 2 events - 'before_all_txs' (fee charge) AND 'after_all_txs' (fee refund)",
+                "before_all_txs fee event: data.i128 is POSITIVE (fee charged from source)",
+                "after_all_txs fee event: data.i128 is NEGATIVE (refund to source)",
+                "Fee event contract_id is the native SAC contract ID (e.g. 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC')",
+                "Fee event topics: ['fee', <source_account_address>]"
+              ]
+            },
+            "diagnosticEvents": {
+              "description": "Diagnostic events for debugging (v4 only)",
+              "invariants": [
+                "Empty [] for classic transactions",
+                "Populated for Soroban transactions with core_metrics, fn_call, fn_return events",
+                "Each event has in_successful_contract_call boolean flag",
+                "core_metrics events track: read_entry, write_entry, cpu_insn, mem_byte, etc."
+              ]
+            }
+          }
+        },
+        "postTxApplyFeeProcessing": {
+          "description": "V2 only: post-application fee changes for Soroban refunds",
+          "invariants": [
+            "Only present in LedgerCloseMetaV2 (TransactionResultMetaV1)",
+            "Empty [] for classic transactions",
+            "Populated for Soroban transactions with STATE + UPDATED for source account",
+            "Contains the Soroban fee refund (balance increases by refund amount)",
+            "Refund amount = declaredFee - feeCharged"
+          ]
+        }
+      }
+    },
+
+    "ledgerEntryChangesInvariants": {
+      "description": "Invariants for LedgerEntryChanges arrays",
+      "type": "object",
+      "changeTypes": {
+        "LEDGER_ENTRY_STATE": {
+          "description": "Captures the state of an entry before modification",
+          "invariants": [
+            "Must be followed by UPDATED or REMOVED for the same key",
+            "Only emitted once per entry per operation",
+            "lastModifiedLedgerSeq reflects when entry was previously modified"
+          ]
+        },
+        "LEDGER_ENTRY_CREATED": {
+          "description": "New entry created",
+          "invariants": [
+            "Entry did not exist before this operation",
+            "lastModifiedLedgerSeq == current ledger seq",
+            "No STATE entry precedes this for the same key in this operation"
+          ]
+        },
+        "LEDGER_ENTRY_UPDATED": {
+          "description": "Entry modified",
+          "invariants": [
+            "Must be preceded by STATE entry for the same key",
+            "lastModifiedLedgerSeq == current ledger seq",
+            "Entry content differs from STATE entry"
+          ]
+        },
+        "LEDGER_ENTRY_REMOVED": {
+          "description": "Entry deleted",
+          "invariants": [
+            "Must be preceded by STATE entry for the same key",
+            "Entry will not exist after this operation"
+          ]
+        },
+        "LEDGER_ENTRY_RESTORED": {
+          "description": "Archived entry restored (protocol >= 21)",
+          "invariants": [
+            "Only applies to persistent Soroban entries",
+            "Entry was previously evicted/archived",
+            "lastModifiedLedgerSeq == current ledger seq"
+          ]
+        }
+      },
+      "generalInvariants": [
+        "Changes are ordered: STATE before UPDATED/REMOVED",
+        "Each key appears at most once as STATE in an operation",
+        "Created entries don't have preceding STATE",
+        "Balance changes are consistent (debits = credits + fees)"
+      ]
+    },
+
+    "upgradesProcessingInvariants": {
+      "description": "Invariants for ledger upgrades",
+      "invariants": [
+        "upgradesProcessing.length == scpValue.upgrades.length (for valid upgrades)",
+        "Invalid upgrades are skipped and not recorded",
+        "upgrade field contains the decoded LedgerUpgrade",
+        "changes contains CONFIG_SETTING modifications for config upgrades",
+        "Applied after all transactions, before finalizing ledger"
+      ],
+      "upgradeTypes": {
+        "LEDGER_UPGRADE_VERSION": "Updates ledgerVersion",
+        "LEDGER_UPGRADE_BASE_FEE": "Updates baseFee",
+        "LEDGER_UPGRADE_MAX_TX_SET_SIZE": "Updates maxTxSetSize",
+        "LEDGER_UPGRADE_BASE_RESERVE": "Updates baseReserve",
+        "LEDGER_UPGRADE_FLAGS": "Updates header flags",
+        "LEDGER_UPGRADE_CONFIG": "Updates ConfigSetting entries",
+        "LEDGER_UPGRADE_MAX_SOROBAN_TX_SET_SIZE": "Updates Soroban lane capacity"
+      }
+    },
+
+    "sorobanSpecificInvariants": {
+      "description": "Soroban-specific invariants (protocol >= 20)",
+      "type": "object",
+      "properties": {
+        "totalByteSizeOfLiveSorobanState": {
+          "description": "Size in bytes of live Soroban state",
+          "invariants": [
+            "Only present in v1/v2",
+            "Used by downstream systems for storage fee calculation",
+            "Value comes from SorobanNetworkConfig.getAverageSorobanStateSize()"
+          ]
+        },
+        "evictedKeys": {
+          "description": "Keys evicted at this ledger",
+          "invariants": [
+            "Contains TTL keys and persistent data/code keys that were evicted",
+            "Temporary entries are deleted (not archived)",
+            "Persistent entries are archived to hot archive"
+          ]
+        },
+        "ext.v1.sorobanFeeWrite1KB": {
+          "description": "Fee rate for writing 1KB of Soroban state",
+          "invariants": [
+            "Only present when EMIT_LEDGER_CLOSE_META_EXT_V1 is true",
+            "Value comes from SorobanNetworkConfig.feeRent1KB()"
+          ]
+        }
+      }
+    },
+
+    "contractEventInvariants": {
+      "description": "Invariants for contract events",
+      "type": "object",
+      "eventTypes": {
+        "SYSTEM": "System-generated events",
+        "CONTRACT": "User contract events",
+        "DIAGNOSTIC": "Debugging events (not included in hash)"
+      },
+      "invariants": [
+        "contractID is the contract that emitted the event",
+        "For native asset SAC events, contractID is derived from Asset",
+        "topics array contains event discriminator",
+        "data contains event payload",
+        "Fee events have 'fee' as first topic symbol",
+        "Transfer events have 'transfer' as first topic symbol"
+      ],
+      "nativeSacContractId": {
+        "description": "For native XLM asset events",
+        "derivation": "SHA256('SACcontractPre' || networkPassphrase || assetXdr)"
+      }
+    },
+
+    "feeEventInvariants": {
+      "description": "Invariants for fee-related events (protocol >= 23)",
+      "type": "object",
+      "invariants": [
+        "Fee events are emitted as TransactionEvent with stage BEFORE_ALL_TXS",
+        "Fee event contractID is native SAC contract ID",
+        "Fee event topics: [symbol:'fee', address:feeSource]",
+        "Fee event data: i128 representing fee amount in stroops",
+        "One fee event per transaction"
+      ]
+    },
+
+    "balanceInvariants": {
+      "description": "Balance and accounting invariants",
+      "invariants": [
+        "Sum of all account balances + feePool == totalCoins",
+        "Fee source balance decreases by exactly feeCharged",
+        "For successful payments: sender decreases, receiver increases by same amount",
+        "For failed transactions: only fee is deducted",
+        "Claimable balance amounts are accounted in totalCoins"
+      ]
+    },
+
+    "sequenceNumberInvariants": {
+      "description": "Sequence number invariants",
+      "invariants": [
+        "After tx: sourceAccount.seqNum == tx.seqNum",
+        "seqLedger updated to current ledgerSeq",
+        "seqTime updated to current closeTime",
+        "For fee bump: inner tx seqNum is used",
+        "Sequence gaps allowed with minSeqNum precondition"
+      ]
+    }
+  },
+
+  "testGenerationGuidelines": {
+    "description": "Guidelines for generating valid test LedgerCloseMeta",
+    "steps": [
+      "1. Determine protocol version and select appropriate LedgerCloseMeta version (v0/v1/v2)",
+      "2. Generate valid LedgerHeader with proper previousLedgerHash",
+      "3. Create transaction set with valid transactions",
+      "4. Compute transaction results based on transaction logic",
+      "5. Generate fee processing changes for each transaction",
+      "6. Generate operation-level changes following STATE->UPDATED/CREATED/REMOVED pattern",
+      "7. For Soroban: generate proper events and sorobanMeta",
+      "8. Apply any upgrades and record upgrade processing",
+      "9. Compute all hashes (header hash, txSetResultHash, etc.)",
+      "10. Validate all invariants before serializing"
+    ],
+    "commonScenarios": {
+      "emptyLedger": {
+        "description": "Ledger with no transactions",
+        "txProcessing": [],
+        "txSet": "Empty transaction set"
+      },
+      "singlePayment": {
+        "description": "Simple XLM payment",
+        "requires": [
+          "Source account STATE->UPDATED (seqNum bump, balance decrease)",
+          "Fee processing for source",
+          "Destination account STATE->UPDATED (balance increase)"
+        ]
+      },
+      "createAccount": {
+        "description": "Create account operation",
+        "requires": [
+          "Source account STATE->UPDATED (balance decrease by starting balance + fee)",
+          "New account CREATED",
+          "Fee event for native SAC"
+        ]
+      },
+      "sorobanInvoke": {
+        "description": "Invoke host function",
+        "requires": [
+          "Fee processing with resource fees",
+          "Contract state changes",
+          "Contract events",
+          "Return value in sorobanMeta",
+          "TTL bumps if applicable"
+        ]
+      },
+      "failedTransaction": {
+        "description": "Transaction that fails",
+        "requires": [
+          "Fee is still charged",
+          "No operation-level changes",
+          "Result code indicates failure reason"
+        ]
+      }
+    }
+  },
+
+  "validationRules": {
+    "description": "Rules for validating LedgerCloseMeta instances",
+    "hashValidation": [
+      "ledgerHeader.hash == SHA256(ledgerHeader.header)",
+      "scpValue.txSetHash == SHA256(txSet)"
+    ],
+    "countValidation": [
+      "txProcessing.length == countTransactionsInTxSet(txSet)"
+    ],
+    "orderValidation": [
+      "txProcessing is in apply order (classic first, then Soroban)",
+      "Within feeProcessing: STATE before UPDATED"
+    ],
+    "balanceValidation": [
+      "All balance changes are consistent",
+      "Fees match feeCharged values"
+    ]
+  }
+}
