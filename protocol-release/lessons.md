@@ -1,0 +1,142 @@
+# Protocol-version end-to-end testing — repos to update + quirks
+
+A new CAP merges into stellar-core. To end-to-end-test it (run a Quickstart node, build a tx exercising the CAP, watch RPC / Horizon / Lab handle it), you have to bump XDR + protocol-version awareness through this stack. Listed in the order each layer depends on the next.
+
+The two anchor commits everything chains off of (set once per CAP cycle):
+
+- **`.x` commit** that has the new types (find in the CAP "XDR Changes" section). For p27/CAP-71+83 this was `stellar-xdr@5187e69`.
+- **Host commit** in `rs-soroban-env` that implements the CAP (the PR merge commit). For CAP-71 this was `7fb0a840812fe8921bb48bebf7b4aa7160467ec8`. Always pin the full SHA; truncated 8-char prefixes can resolve ambiguously, and the version baked into a host's `Cargo.toml` does NOT mean the host has the CAP (`v26.1.2 = c0e58f94` predates CAP-71 even though the CAP-71 merge also self-reports `26.1.2`).
+
+When a CAP-71-merged host releases on crates.io, the pre-release `git=` pins flip back to `version =` pins (cf. `stellar-rpc#595` → `#640` pattern).
+
+### Cross-cutting traps (apply everywhere)
+
+- **Truncated SHAs lie.** Always pin the full 40-char commit hash. GitHub's compare API will happily resolve an 8-char prefix to a different commit. (Lost ~10 minutes on `7fb0a840fd16…` vs the real `7fb0a840812f…`.)
+- **A package version != a CAP membership.** Cross-check via `gh api repos/X/Y/compare/<cap-merge>...<candidate> --jq .status` → `identical`/`ahead` means the CAP is in; `behind` means it's not. Don't trust release-tag commit messages.
+- **`yarn`/`pnpm` content-addressable cache for `file:` tarballs only invalidates on path change, not on file content.** After repacking the same tarball name, the package manager will reuse the cached extract — even after `yarn cache clean`. Workaround: rename the tarball (e.g., `pack.tgz` → `pack-v2.tgz`) and update every `file:` ref. This was the only way to force a refresh during the lab fix loop.
+- **Default branches are inconsistent.** `master`: `stellar-core`, `js-stellar-base`, `js-stellar-sdk`. `main`: most rs-* repos, `go-stellar-sdk`, `stellar-rpc`, `stellar-horizon`, `js-stellar-xdr-json`, `laboratory`. `gh pr create --base main` returns "Base ref must be a branch" if the repo uses `master`. Look it up with `gh api repos/X/Y --jq .default_branch` before scripting PRs.
+- **`.github/workflows/*.yml` pushes — attempt first, react to error.** Pushing a commit that touches a workflow file *can* fail if the OAuth token lacks the `workflow` scope. Don't pre-emptively avoid workflow edits — just push and react to the actual error if and when it happens.
+- **Protocol-vNext core images are published under `-vnext` tags, NOT `N+1.x.x`.** For any work needing a protocol-N+1 core binary (load-test fixture regen, multi-node demos, integration-test matrix bumps), Docker Hub publishes them on `stellar/unsafe-stellar-core` (and `stellar/stellar-core`) with a `-vnext` *suffix*. Example: `stellar/unsafe-stellar-core:27.0.1-3348.ff61f2e6d.jammy-vnext` is a P28-capable build — the numeric version `27.0.1` is the *base release*, not the protocol. Searching tags by `name=28.0` returns 0 hits — wrong conclusion is "no P28 image exists." Right query:
+   ```
+   curl -s "https://hub.docker.com/v2/repositories/stellar/unsafe-stellar-core/tags/?page_size=100&name=vnext" | jq '.results[].name'
+   ```
+   This is exactly where the first p28-cap-0083 horizon PR deferred v28 fixture generation — the image was right there with `-vnext`.
+- **Match the previous-protocol's package/image *variant* when bumping.** stellar-core ships in a few build flavors: plain (`...jammy`), buildtests (`...jammy~buildtests`, assertions enabled — slower), and vnext (`...jammy~vnext`) / vnext-buildtests (`...jammy~vnext~buildtests`). Docker repos similarly split between `stellar/stellar-core` (release) and `stellar/unsafe-stellar-core` (prerelease/vnext-only). When you add a new-protocol leg, look at the *previous* protocol's pin and mirror its choices — if the previous leg used plain (no `~buildtests`), the new leg should use plain-vnext (`...jammy~vnext`), NOT vnext-buildtests. Mixing variants silently changes test pacing (the buildtests flavor's assertion overhead is enough to make backfill/timing-sensitive tests miss their polling deadlines). The docker repo (`stellar-core` vs `unsafe-stellar-core`) is the only thing you may have to switch — vnext tags only live on `unsafe-stellar-core`.
+- **`dependency-sanity-checker` failures on protocol-next PRs are EXPECTED, not blockers.** stellar-rpc's `scripts/check-dependencies.bash` enforces *steady-state* invariants (single source per crate@version, exact Go/Rust stellar-xdr match, `p{N}-expect.txt` present for every matrix leg). During a protocol-next transition all three of those temporarily break for well-understood reasons: `-prev` and `-curr` may legitimately come from different sources (registry vs git rev) at the same `crate@version`; Go's stellar-xdr regenerates as soon as the CAP's XDR lands while rs-stellar-xdr lags by 1-2 commits; new-protocol `p{N}-expect.txt` ships alongside the host bump, not before. **Do not patch the script to silence these.** The maintainer expects to see the failures in CI output, the `dependency-sanity-checker` check is not a merge blocker on a protocol-next PR, and any "fix" to the script papers over real divergences. The protocol-release loop respects this via `IGNORED_CHECKS=dependency-sanity-checker,complete` (default) — both checks are filtered from `pr_is_green` / `failure_signal`, so the watch loop won't burn plan-review cycles trying to fix them. (Lost ~3 cycles patching this script before settling on revert + ignore.)
+
+---
+
+## Rust stack (host, XDR, SDK)
+
+### `stellar/rs-stellar-xdr`
+Anchor of the Rust XDR. The CAP-71 era introduced a per-cap-feature layout — there is no `curr` module any more; everything is at the crate root, gated by `cap_<n>` features. So:
+
+- `features = ["curr", ...]` → `features = ["cap_<n>", ...]` (use the right cap).
+- All `use stellar_xdr::curr::*;` in downstream Rust → `use stellar_xdr::*;`.
+- `xdr2json/src/lib.rs` in rpc has its own `use stellar_xdr::curr as xdr;` — flip to `use stellar_xdr as xdr;`.
+- **`stellar-xdr xfile preprocess --features CAP_<n>,...`** (PR #503) is the canonical way to resolve `#ifdef` in `.x` before any non-Rust codegen. `goxdr` and Ruby `xdrgen` both choke on `#`.
+
+### `stellar/rs-soroban-env`
+The host. When a CAP host PR merges, all downstream things that embed the host (`stellar-rpc`'s preflight, `stellar-core` internally) need to pin to the merge SHA. The host's package version (`Cargo.toml`) does **not** track CAP membership — two commits can both self-report `26.1.2`; only one has the CAP.
+
+### `stellar/rs-soroban-sdk`
+Contract-side SDK. New host fns (e.g., CAP-71's `delegate_account_auth`, `get_delegated_signers_for_current_auth_check`) appear automatically on `env-common`'s `Env` trait once the env crate is pinned to the CAP host SHA — they're generated from `env.json`. You then add a thin wrapper on `Address` (or wherever) that mirrors `require_auth`: `internal::Env::delegate_account_auth(self, address.to_object()).unwrap_infallible()`. ~5 lines, no special integration.
+
+When bumping the env-common dep: drop the `=26.1.x` version pin (the rev's package may self-report a different patch version), keep major-version compatibility.
+
+### `stellar/stellar-cli` (`stellar-contract-cli`)
+**Skip this for live e2e testing unless explicitly needed.** Bumping the CLI's `stellar-xdr` to a per-cap-feature rev produces ~70 cascading `E0308` errors because **`stellar-rpc-client` (a separate crates.io publish) returns types typed against its own pinned `stellar-xdr`**. You'd see "expected `TransactionEnvelope`, found `stellar_xdr::TransactionEnvelope`" everywhere. Real fix requires also bumping `stellar-rpc-client` to a CAP-aware fork. For testing you don't need it: RPC's `simulateTransaction` is server-side, and a 200-line custom Rust signer using `rs-stellar-xdr@<cap-rev>` can submit new-credential-type txs directly (see `cap71-signer/` in this dir as a template).
+
+---
+
+## Go stack (services consuming LCM XDR)
+
+### `stellar/go-stellar-sdk` (renamed from `stellar/go`)
+Single Go XDR provider for `stellar-rpc`, `stellar-horizon`, `galexie`. PR template: `#595` for p25 era, `#623` for p26 — both target `protocol-next` not `main`.
+
+- Bump `Makefile XDR_COMMIT` to the new `.x` SHA.
+- Add `XDR_FEATURES ?= CAP_<n>,...` and the `stellar-xdr xfile preprocess` step inside the `xdr/%.x` recipe (because `goxdr` and Ruby `xdrgen` can't parse `#ifdef`).
+- Drop `-it` from the Ruby `xdrgen` recipe (breaks in CI).
+- `make xdr` → commit `Makefile` + downloaded `xdr/*.x` + the three generated files (`xdr/`, `gxdr/`, `xdr/xdr_views_generated.go`).
+- Base on `protocol-next` and not a release tag. If you base on a tag you'll get a 9-commit reverting-everything diff against main.
+- **Productionizing the fork pin (once the upstream SDK PR merges):** in each downstream `go.mod`, `go mod edit -dropreplace github.com/stellar/go-stellar-sdk`, then `go get github.com/stellar/go-stellar-sdk@<merged-upstream-FULL-sha>` + `go mod tidy` (full SHA — truncated SHAs lie). When you drop the `replace`, also remove any **SPIKE-only `gomoddirectives.replace-allow-list`** exception that was added solely to permit it — present in `stellar-rpc/.golangci.yml`, absent in `stellar-horizon`. The allow-list entry and the `replace` are a pair; drop them together, and if removing the entry empties the `gomoddirectives` block delete the now-empty stanza too (then `golangci-lint config verify` to confirm). If the fork head and the merged commit share the same git tree (review-confirmed), the re-pin is content-identical and `go.sum` just swaps the module path.
+
+### `stellar/stellar-horizon`
+- `internal/ingest/main.go`: bump `MaxSupportedProtocolVersion`.
+- `go mod edit -replace github.com/stellar/go-stellar-sdk=github.com/<your-fork>/go@<sha>` and `go mod tidy`.
+- **`.github/workflows/horizon.yml` protocol-version matrix:** add the new protocol N to the `protocol-version:` list AND drop the oldest one (the matrix maintains a rolling window of the two most-recent supported protocols). Also add a matching `PROTOCOL_N_CORE_DOCKER_IMG` / `PROTOCOL_N_CORE_DEBIAN_PKG_VERSION` / `PROTOCOL_N_STELLAR_RPC_DOCKER_IMG` env block using a `-vnext` core image (see cross-cutting trap on `-vnext` tags). Don't skip this — the PR isn't "validating protocol N" without it.
+- **When the new-protocol `_STELLAR_RPC_DOCKER_IMG` isn't published yet, leave it EMPTY** so `NewTest()`'s existing AMBER skip fires for RPC-dependent tests (sac/invokehostfunction/extend_footprint_ttl/txsub/transaction). Do NOT reuse the previous protocol's RPC image, and do NOT add a from-source build step (cloning the rpc PR, `docker build`, SHA-pin maintenance, cache-key updates). Two parts:
+   ```yaml
+   # No Protocol N stellar-rpc image published yet (tracked: <rpc PR>).
+   # EMPTY on purpose — see SUPERSEDED note. Re-pin once a real image publishes.
+   PROTOCOL_N_STELLAR_RPC_DOCKER_IMG: ""
+   ```
+   and guard the "Pull and set Stellar RPC image" step so it does not run `docker pull ""` when the var is empty.
+   **SUPERSEDED (2026-06-16):** the earlier claim that for consensus-layer CAPs (CAP-0083 style) the previous-protocol RPC image is "functionally adequate" is **wrong** when integration tests bring RPC up against the new-protocol network. The reused image bundles a previous-protocol captive-core that cannot ingest the new protocol, so every `EnableStellarRPC` test hangs in `waitForStellarRPC()` reporting "data stores are not initialized: DB is empty" until the 75m suite timeout panics the whole run. Leaving the var empty (AMBER-skip) is the correct fix.
+- `TestCoreLCMIngestion` consumes meta generated through stellar-core test cases. If the feature being tested can be observed through stellar-core LedgerCloseMeta, and there's a stellar-core test case that exercises this new feature, you can run the test with `--capture-lcm`, and run that generated file to through `TestCoreLCMIngestion`.
+- **Protocol-versioned testdata under `internal/integration/testdata/` (e.g. `unlimited-config-v{N}.xdr`, `load-test-fixtures-v{N}.xdr.zstd`, `load-test-ledgers-v{N}.xdr.zstd`):** missing `*-v{N}.*` files surface as `os.ReadFile` errors in test setup, killing every test that calls `NewTest()` on the new-protocol leg. **Try copying the previous-protocol file first** (e.g. `cp unlimited-config-v27.xdr unlimited-config-v28.xdr`) — if the new CAP doesn't touch the data the file encodes (e.g. a consensus-layer CAP like CAP-0083 doesn't change Soroban `ConfigSettings`), the byte-identical copy works as-is. Only regenerate when the new CAP actually changes the relevant data.
+
+### `stellar/stellar-rpc`
+Two layers: Go (uses `go-stellar-sdk` like horizon) + Rust preflight (`cmd/stellar-rpc/lib/{preflight,xdr2json}`).
+- Multi-protocol host pattern: `-prev` and `-curr` Cargo deps. On bump, **shift the window**: `-prev` ← what `-curr` used to point at; `-curr` ← git ref to the new host SHA.
+- If you advance `-prev`, audit `cmd/stellar-rpc/lib/preflight/src/lib.rs prev::load_network_config` — the soroban-simulation API has drifted (e.g., `load_from_snapshot` arg count between `25.2.1` and `26.0.1` under `unstable-next-api`).
+- `cargo update -p ethnum` will be needed once after the bump.
+- Go side: same `go mod edit -replace` for `go-stellar-sdk` as horizon.
+- The integration-test const `MaxSupportedProtocolVersion = 24` in `cmd/stellar-rpc/internal/integrationtest/...` is *not* part of the protocol-bump pattern (#623 didn't touch it).
+- **`.github/workflows/stellar-rpc.yml` integration matrix:** unlike horizon's single matrix axis, rpc has one `integration-p{N}-pkg` job block per supported protocol (each calls the reusable `./.github/workflows/integration-tests.yml`). Add a new `integration-p{N}-pkg` stanza for the new protocol AND drop the oldest one (rolling window of the two most-recent supported protocols). The new-protocol stanza must use a **`-vnext`** core image (`core_docker_img: 'stellar/unsafe-stellar-core:<base>.jammy-vnext'`), and a deb version that mirrors the *previous*-protocol leg's variant — if P{N-1} uses `<base>.jammy` (plain), use `<base>.jammy~vnext`; if P{N-1} uses `<base>.jammy~buildtests`, use `<base>.jammy~vnext~buildtests` (see cross-cutting trap on variant matching — assertion overhead from `~buildtests` is enough to make timing-sensitive backfill tests miss their deadlines). Don't skip the leg — without it the PR's protocol-N code paths aren't exercised in CI even when the PR is green (the green signal only covers older legs + lints + CodeQL).
+- **Protocol-versioned upgrade fixtures under `cmd/stellar-rpc/internal/integrationtest/infrastructure/docker/upgrades/` (e.g. `unlimited.p{N}.{xdr,json}`, `testnet.p{N}.{xdr,json}`):** `upgradeLimitsWithFile()` builds the filename as `fmt.Sprintf("%s.p%d.xdr", limitFile, i.protocolVersion)`, and `upgradeFiles.ReadFile(...)` failing on ENOENT short-circuits every test that calls `NewTest()` on the new-protocol leg (the failure surfaces as `require.NoError` in `infrastructure/test.go`, with a stack pointing into `upgradeLimits`). **Try copying the previous-protocol file first** (e.g. `cp unlimited.p27.xdr unlimited.p28.xdr` and the matching `.json`) — for consensus-layer CAPs that don't change Soroban `ConfigSettings`, the bytes are identical; only regenerate when the new CAP actually changes the settings.
+
+### `stellar/galexie`
+Same as horizon — only the `go-stellar-sdk` dep flips. We didn't exercise it for p27 but the pattern matches.
+
+---
+
+## JS stack (laboratory)
+
+### `stellar/js-stellar-base`
+The actual JS XDR codec. Drives both `@stellar/stellar-sdk` and stellar-laboratory's runtime decoding.
+
+- Bump `XDR_BASE_URL_{CURR,NEXT}` in the Makefile to the new `.x` SHA.
+- Add `stellar-xdr xfile preprocess --features CAP_<n>,...` before the Ruby `xdrgen` step (same `#ifdef` problem).
+- Drop `-it` from `docker run` invocations (CI).
+- The dts-xdr step uses `node:alpine`; the newer alpine doesn't ship yarn. Switch to `node:lts-alpine` and `apk add --update yarn` in the same docker step.
+- **Post-process must INLINE `xdr.const` values at every usage site**, not just inject `var <NAME> = <value>;` declarations. xdrgen master emits `xdr.string(SCSYMBOL_LIMIT)` etc. as bare identifiers, but `@stellar/js-xdr`'s `TypeBuilder.const()` doesn't put the name into the calling scope — and the obvious patch ("inject `var SCSYMBOL_LIMIT = 32;` at IIFE top") looks correct in the unminified dev build but **terser DCE strips the `var` from the production browser dist** (it can't trace the bare-identifier usage back through xdrgen's pattern). The robust patch: collect every `xdr.const("NAME", N)` in `src/generated/{curr,next}_generated.js` and substitute every remaining bare `\bNAME\b` reference with the literal `N`. Then there's no identifier for terser to drop. (Long-term fix is in xdrgen / js-xdr; until aligned, post-process this way.)
+- `next.d.ts` may fail in the dts-xdr step (prettier missing in the container). Not blocking — runtime is `.js`; types are dev-time only.
+
+### `stellar/js-stellar-sdk`
+Re-points its `@stellar/stellar-base` dep at the patched fork **AND** must rebuild its own browser bundle.
+
+- Default branch is **`master`**, not `main` — both `js-stellar-base` and `js-stellar-sdk` use master. PR creation with `--base main` will return "Base ref must be a branch."
+- The SDK's `prepare` hook (`yarn build:prod`) currently emits `TS7006: implicit any` errors when typechecking against the regenerated stellar-base types (xdrgen master's `.d.ts` shape differs from the released v15.0.0). The pre-built `lib/` outputs are committed in the repo, so runtime is fine; a proper PR would also pin xdrgen + dts-xdr revs to ones whose .d.ts output the SDK still typechecks against.
+- **The SDK's `package.json` declares `"browser": "./dist/stellar-sdk.min.js"`** — a pre-built browser bundle that inlines stellar-base's XDR at SDK build time. Webpack/Next.js consumers use this entry, NOT `lib/`. So after bumping `@stellar/stellar-base`, you MUST `yarn build:browser` to regenerate the dist or all browser consumers continue to see the OLD XDR. (This was the actual cause of the "unknown SorobanCredentialsType value 3" in lab; the dep tree had a duplicate stellar-sdk via Trezor too, but that turned out to be a red herring — the broken decode was the SDK's own browser bundle.)
+- `yarn add "github:user/repo#branch"` for a JS package **clones the source directory**, not the published artifact — `dist/` and `lib/` won't be present unless the repo commits built artifacts or has a working `prepare` script. For SPIKE branches, use a local `file:tarball.tgz` produced by `yarn pack` after building.
+
+### `stellar/js-stellar-xdr-json`
+Rust → wasm XDR-to-JSON decoder, separately packaged on npm as `@stellar/stellar-xdr-json`. Used by stellar-laboratory alongside stellar-base for "raw XDR view" rendering.
+
+- `Cargo.toml` `stellar-xdr` dep → git rev at the CAP-aware SHA with `features = ["std", "cap_<n>", "base64", "serde", "serde_json", "schemars"]`. Drop the `"curr"` feature.
+- `src/lib.rs` import: `use stellar_xdr::curr::{Limited, ...}` → `use stellar_xdr::{...}`.
+- `wasm-opt` (from local binaryen) may reject bulk-memory ops in the new XDR's wasm. Set `[package.metadata.wasm-pack.profile.release] wasm-opt = false` — output is unoptimized but functionally correct. Long-term fix is bumping binaryen.
+
+### `stellar/laboratory`
+Web app that depends on all three of the above + `@stellar-expert/contract-wasm-interface-parser`.
+
+- Bump `@stellar/stellar-base`, `@stellar/stellar-sdk`, and `@stellar/stellar-xdr-json` to the patched forks. Add a `resolutions` entry for `@stellar/stellar-base` so all transitive consumers see the same patched version. **Don't chase the duplicate `@stellar/stellar-sdk@14.2.0` that `@trezor/blockchain-link` transitively pulls in** — it's bundled into a separate webpack chunk that lab's tx-render path doesn't reach. Pursuing pnpm-overrides for that one is wasted effort; the actual fix is in `js-stellar-sdk`'s own browser dist (see above).
+- Per laboratory's `CLAUDE.md`: also consider `@stellar-expert/contract-wasm-interface-parser` — it depends on matching XDR defs to parse contract wasm; outdated, it silently fails. (We didn't need it for tx rendering; we'd need it for the contract-explorer routes.)
+- After bumping, one `@ts-expect-error` directive in `src/app/(sidebar)/transactions-explorer/tx/[tx]/components/TransactionDetails.tsx` becomes unused (the new types make the line type-check naturally) — drop the comment or `pnpm build` fails on "Unused @ts-expect-error directive."
+- Add `NEXT_PUBLIC_CUSTOM_{HORIZON_URL,RPC_URL,PASSPHRASE}` env-var fallbacks in `src/store/createStore.ts`'s `defaultCustomNetwork` — the Quickstart-bundled lab is started with `NEXT_PUBLIC_DEFAULT_NETWORK=custom` but currently has no way to also supply the URLs, so the only way to make deep links work is to enter horizon/rpc/passphrase in the network UI once. With the env-var fallback, the bundled lab can be parameterized at start time.
+- Package manager is `pnpm@10.x` (via the `packageManager` field). Lab needs `corepack enable && pnpm install --frozen-lockfile`.
+- **Always `rm -rf .next build` between stellar-base reinstalls and `pnpm build`** — Next.js' production cache keeps the broken chunks from the previous build's stellar-base copy even after `node_modules/` is updated.
+- The `stellar-lab` supervisor program in Quickstart's nightly-next image is **`autostart=false`** — you have to `docker exec <container> supervisorctl start stellar-lab` once, otherwise `/lab` returns 502.
+
+---
+
+## Quickstart (`docker-stellar-core-horizon`)
+
+Container that ties it all together. `images.json` declares deps; the Dockerfile has per-service build stages.
+
+- For iteration: build only the changed binaries via `--target stellar-{core,rpc,horizon}-builder` and layer them onto `nightly-next` with a tiny `COPY --from=…` Dockerfile. Full `make build` is ~hour-long.
+- **Use full commit SHAs as `*_REF`** build-args, not branch names. Docker caches by build-arg value and will reuse stale layers after a force-push.
+- `nightly-next` already targets protocol 27 (`protocol_version_default: 27`, `horizon_skip_protocol_version_check: true`); for a custom build, inherit from it in `images.json` and override only what differs.
+- `--local` is single-validator only. For multi-node demos (e.g., to try forcing CAP-83 skip ledgers in production-like topology), write a custom docker-compose using the patched image's `/usr/bin/stellar-core` directly. (Practically: live skips can't be reliably forced because tx flooding bypasses the timeout. The PR's own deterministic unit tests are the authoritative validation.)
+- `etc/config-settings/p<N>/` only goes up to p26. Soroban limits fall back to the nearest lower dir, or pass `--limits default`.
