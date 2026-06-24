@@ -39,6 +39,8 @@ Anchor of the Rust XDR. The CAP-71 era introduced a per-cap-feature layout — t
 ### `stellar/rs-soroban-env`
 The host. When a CAP host PR merges, all downstream things that embed the host (`stellar-rpc`'s preflight, `stellar-core` internally) need to pin to the merge SHA. The host's package version (`Cargo.toml`) does **not** track CAP membership — two commits can both self-report `26.1.2`; only one has the CAP.
 
+Authoring a host CAP: declare new host fns in `soroban-env-common/env.json` (regenerates the `Env` trait), implement bodies in `soroban-env-host`. Next-protocol additions gate behind the `next` cargo feature (`#[cfg(feature = "next")]`) and per-fn `min_supported_protocol` / `check_protocol_version_lower_bound`.
+
 ### `stellar/rs-soroban-sdk`
 Contract-side SDK. New host fns (e.g., CAP-71's `delegate_account_auth`, `get_delegated_signers_for_current_auth_check`) appear automatically on `env-common`'s `Env` trait once the env crate is pinned to the CAP host SHA — they're generated from `env.json`. You then add a thin wrapper on `Address` (or wherever) that mirrors `require_auth`: `internal::Env::delegate_account_auth(self, address.to_object()).unwrap_infallible()`. ~5 lines, no special integration.
 
@@ -46,6 +48,16 @@ When bumping the env-common dep: drop the `=26.1.x` version pin (the rev's packa
 
 ### `stellar/stellar-cli` (`stellar-contract-cli`)
 **Skip this for live e2e testing unless explicitly needed.** Bumping the CLI's `stellar-xdr` to a per-cap-feature rev produces ~70 cascading `E0308` errors because **`stellar-rpc-client` (a separate crates.io publish) returns types typed against its own pinned `stellar-xdr`**. You'd see "expected `TransactionEnvelope`, found `stellar_xdr::TransactionEnvelope`" everywhere. Real fix requires also bumping `stellar-rpc-client` to a CAP-aware fork. For testing you don't need it: RPC's `simulateTransaction` is server-side, and a 200-line custom Rust signer using `rs-stellar-xdr@<cap-rev>` can submit new-credential-type txs directly (see `cap71-signer/` in this dir as a template).
+
+---
+
+## stellar-core (validator — consensus/host layer)
+
+Build next-protocol code paths + tests with `./configure --enable-next-protocol-version-unsafe-for-production`.
+
+- **Protocol bump:** `Config::CURRENT_LEDGER_PROTOCOL_VERSION` in `src/main/Config.cpp`; named version constants in `src/util/ProtocolVersion.h` (CAP-0083 = `EMPTY_TX_SET_PROTOCOL_VERSION = V_28`). Gate CAP code with `protocolVersionStartsFrom(ledgerVersion, <X>_PROTOCOL_VERSION)`.
+- **TxMeta baseline:** CI runs `stellar-core test --check-test-tx-meta` against committed `test-tx-meta-baseline-{current,next}` (CONTRIBUTING.md "Running and updating TxMeta checks"); a CAP that changes tx semantics fails it *by design*. Re-record with `stellar-core test [tx] --all-versions --rng-seed 12345 --record-test-tx-meta test-tx-meta-baseline-next` (`-next` needs the vnext build flag above) and commit — making CI pass this way is fine, expected when the CAP changes semantics or adds tests. Inspect the JSON diff; if a tx changes that you did NOT expect, flag it in the PR for the reviewer, but still commit and continue — don't block.
+- **vnext image is a manual Jenkins handoff.** Core's own CI doesn't need it, but downstream integration legs (horizon/rpc) do. After the core change, Jenkins builds the `-vnext` debian + docker image (manual for now); downstream legs block until it publishes (see `-vnext` trap above; LCM via `--capture-lcm` → `TestCoreLCMIngestion`, under stellar-horizon).
 
 ---
 

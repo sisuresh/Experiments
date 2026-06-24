@@ -181,6 +181,22 @@ When a CI failure is a real product break — not a flake, not a test
 expectation that needs updating for the new protocol — stop landing the
 chain and escalate.
 
+### Feature-implementation repos (stellar-core, rs-soroban-env)
+
+When the inputs file asks this run to *implement* a CAP (not just propagate
+it), stellar-core / rs-soroban-env are in-scope. There is no reference PR —
+use the most recent protocol-version-bump commits in the local checkout as
+the exemplar, plus that repo's `lessons.md` section. Two hard rules:
+
+- **stellar-core TxMeta check:** a red `--check-test-tx-meta` is fine to fix
+  by re-recording the baseline and committing — expected when the CAP changes
+  tx semantics or adds tests. Inspect the JSON diff; if a tx changes that you
+  did not expect, flag it in the PR for the reviewer, but still commit and
+  continue. Human review catches it downstream.
+- **The vnext core image is a manual Jenkins handoff.** A downstream red whose
+  cause is a missing protocol-N `-vnext` image is `SKIP`, not a fix: wait for
+  the operator to trigger the build, then resume.
+
 ---
 
 ## Driver script: `protocol-release-loop.sh`

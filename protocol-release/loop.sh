@@ -524,6 +524,10 @@ OPERATING MODE (do not deviate):
   artifact (missing tool, no published image, etc.), do the parts that
   ARE possible, open the PR with what you have, and document what's
   deferred in the PR description. A partial PR is the desired outcome.
+- Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass
+  is fine (expected when the CAP changes tx semantics or adds tests).
+  Inspect the diff; if a tx changed that you did NOT expect, note it in the
+  PR for the reviewer — but still commit and continue, don't block.
 
 PR DESCRIPTION STYLE: keep it short — ideally under 15 lines. Bulleted
 '## Changes' (what landed) + '## Deferred' (what's not in this PR and
@@ -777,6 +781,11 @@ $fix_plan" "$repo")"
     fix_out="$(cd "$repo" && ask_claude "Apply this fix. The plan names a
 target repo. If the target is one of the in-scope checkouts, cd there
 and push to its existing PR branch (do NOT open a new PR for it).
+
+Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass is
+fine (expected when the CAP changes tx semantics or adds tests). Inspect the
+diff; if a tx changed that you did NOT expect, note it in the PR for the
+reviewer — but still commit and continue, don't block.
 
 If the target is an UPSTREAM repo that does NOT yet have a PR in this
 run, clone it into $WORK_DIR/<owner>--<name>/, create a release-named
