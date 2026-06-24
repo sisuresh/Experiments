@@ -116,8 +116,11 @@ For each repo, the same loop applies:
    - `.gitmodules` + a commit-hash file (stellar-core's xdr submodule)
    - `images.json` (Quickstart)
 2. **Bump the pin** to the upstream release ref.
-3. **Run the regen / build** the repo's own README or Makefile specifies.
-4. **Fix any fallout** the build surfaces (deprecated APIs, generated-code
+3. **Regen, then build AND run the relevant tests locally before pushing** —
+   per the repo's README/Makefile. Best effort: if the local toolchain can't
+   build (missing deps, no DB, etc.), fall back to push + rely on CI, and note
+   it in the PR.
+4. **Fix any fallout** the build/tests surface (deprecated APIs, generated-code
    changes, test fixtures that no longer decode, mock interfaces that need
    new methods).
 5. **Push, watch CI, iterate.**
@@ -186,8 +189,14 @@ chain and escalate.
 When the inputs file asks this run to *implement* a CAP (not just propagate
 it), stellar-core / rs-soroban-env are in-scope. There is no reference PR —
 use the most recent protocol-version-bump commits in the local checkout as
-the exemplar, plus that repo's `lessons.md` section. Two hard rules:
+the exemplar, plus that repo's `lessons.md` section.
 
+- **Build + test these locally before pushing.** rs-soroban-env: `cargo
+  build`/`cargo test`. stellar-core: `./configure
+  --enable-next-protocol-version-unsafe-for-production`, build, run the
+  affected tests. If the CAP is observable in LedgerCloseMeta, capture it from
+  a core test (`--capture-lcm`) and commit the `.xdr` into horizon's
+  LCM-ingestion fixtures (see `lessons.md` stellar-horizon).
 - **stellar-core TxMeta check:** a red `--check-test-tx-meta` is fine to fix
   by re-recording the baseline and committing — expected when the CAP changes
   tx semantics or adds tests. Inspect the JSON diff; if a tx changes that you

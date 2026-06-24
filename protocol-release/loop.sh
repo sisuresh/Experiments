@@ -524,6 +524,10 @@ OPERATING MODE (do not deviate):
   artifact (missing tool, no published image, etc.), do the parts that
   ARE possible, open the PR with what you have, and document what's
   deferred in the PR description. A partial PR is the desired outcome.
+- Build AND run the relevant tests locally before pushing (best effort —
+  if the local toolchain can't build, push and rely on CI, and say so in
+  the PR). For stellar-core, configure with
+  \`--enable-next-protocol-version-unsafe-for-production\` first.
 - Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass
   is fine (expected when the CAP changes tx semantics or adds tests).
   Inspect the diff; if a tx changed that you did NOT expect, note it in the
@@ -781,6 +785,10 @@ $fix_plan" "$repo")"
     fix_out="$(cd "$repo" && ask_claude "Apply this fix. The plan names a
 target repo. If the target is one of the in-scope checkouts, cd there
 and push to its existing PR branch (do NOT open a new PR for it).
+
+Build and run the relevant tests locally before pushing (best effort — fall
+back to push + CI if the local toolchain can't build). For stellar-core,
+configure with \`--enable-next-protocol-version-unsafe-for-production\` first.
 
 Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass is
 fine (expected when the CAP changes tx semantics or adds tests). Inspect the
