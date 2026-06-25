@@ -125,7 +125,12 @@ done
 [[ -f "$INPUTS" ]] || { echo "ERROR: inputs file not found: $INPUTS" >&2; exit 1; }
 [[ -f "$CONTRACT" ]] || { echo "ERROR: contract doc missing: $CONTRACT" >&2; exit 1; }
 [[ -f "$LESSONS" ]] || { echo "ERROR: lessons doc missing: $LESSONS" >&2; exit 1; }
-gh auth status >/dev/null 2>&1 || { echo "ERROR: gh not authenticated" >&2; exit 1; }
+_gh_ok=false
+for _i in 1 2 3; do
+  if gh auth status >/dev/null 2>&1; then _gh_ok=true; break; fi
+  sleep 3
+done
+[[ "$_gh_ok" == true ]] || { echo "ERROR: gh not authenticated (after 3 tries)" >&2; exit 1; }
 
 # Portable sha1 (shasum on macOS, sha1sum on Linux, either is fine).
 if command -v shasum >/dev/null 2>&1; then
@@ -178,6 +183,8 @@ done < <(
     in_block && /^##[[:space:]]/ {in_block=0}
     in_block && /^[[:space:]]*-[[:space:]]/ {
       sub(/^[[:space:]]*-[[:space:]]+/, "")
+      sub(/[[:space:]]*#.*$/, "")    # strip inline comments
+      sub(/[[:space:]]+$/, "")       # strip trailing whitespace
       print
     }
   ' "$INPUTS"
@@ -502,6 +509,8 @@ open_pr_for_repo() {
   plan="$(plan_then_review "Bump this repo for the protocol release per the contract" "$repo")"
 
   log "EXECUTE (claude): apply plan, commit, push, open draft PR for $(basename "$repo")"
+  local bdir blog build_cmd build_rc bcycle bp waited
+  bdir="$WORK_DIR/.build-$(basename "$repo")-$$-$RANDOM"; mkdir -p "$bdir"; blog="$bdir/log"
   exec_out="$(cd "$repo" && ask_claude "Apply the plan in full.
 
 The plan may name multiple repos (this one PLUS upstream repos). For
@@ -517,6 +526,11 @@ EACH repo named in the plan:
 
 OPERATING MODE (do not deviate):
 
+- ALWAYS open every PR against the UPSTREAM repo (e.g. \`stellar/<repo>\`) as a
+  cross-fork PR: push the branch to your fork, then
+  \`gh pr create -R stellar/<repo> --base <base-branch> --head <fork-owner>:<branch>\`.
+  NEVER open a fork-internal PR (base on your own fork) and NEVER invent a
+  synthetic base branch to get a clean diff (see lessons.md).
 - Open every PR the plan calls for in THIS run. Do not defer upstream
   work to the operator. Do not respond with 'this PR is blocked on
   upstream; please open the upstream PR yourself' — open it.
@@ -524,10 +538,14 @@ OPERATING MODE (do not deviate):
   artifact (missing tool, no published image, etc.), do the parts that
   ARE possible, open the PR with what you have, and document what's
   deferred in the PR description. A partial PR is the desired outcome.
-- Build AND run the relevant tests locally before pushing (best effort —
-  if the local toolchain can't build, push and rely on CI, and say so in
-  the PR). For stellar-core, configure with
-  \`--enable-next-protocol-version-unsafe-for-production\` first.
+- Builds/tests: if quick (cargo/go, a few minutes), run them synchronously now.
+  If a LONG build/test is needed before finalizing (e.g. a full stellar-core
+  compile, or a TxMeta re-record that needs a freshly built test binary), do
+  NOT run it yourself and do NOT background it — make all source edits first,
+  then output a single line \`RUN_BUILD: <shell command runnable from the repo
+  root>\` as the LAST line and STOP (do not push or open the PR yet). The script
+  runs that build, waits for it however long it takes, and re-invokes you with
+  the exit code + log to commit, push, and open the PR.
 - Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass
   is fine (expected when the CAP changes tx semantics or adds tests).
   Inspect the diff; if a tx changed that you did NOT expect, note it in the
@@ -546,7 +564,38 @@ print every PR URL you opened or pushed to. The script harvests these.
 The FIRST URL must be the PR for $repo (i.e., the working repo).
 
 PLAN:
-$plan")"
+$plan")" || true
+
+  # Long-build handoff: if claude asked the script to run a build (RUN_BUILD:),
+  # the SCRIPT runs it — no LLM-turn time limit, no background-process reaping —
+  # then re-invokes claude with the result to finish. Loops if another build is
+  # requested. Tunable: MAX_BUILD_WAIT (default 5400s), MAX_BUILD_CYCLES (4).
+  bcycle=0
+  build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
+  while [[ -n "$build_cmd" ]] && [[ "$bcycle" -lt "${MAX_BUILD_CYCLES:-4}" ]]; do
+    bcycle=$((bcycle+1))
+    log "  ⏳ RUN_BUILD (cycle $bcycle) for $(basename "$repo"): $build_cmd"
+    log "     watch: tail -f $blog   (max ${MAX_BUILD_WAIT:-5400}s)"
+    ( cd "$repo" && eval "$build_cmd" ) > "$blog" 2>&1 &
+    bp=$!; waited=0
+    while kill -0 "$bp" 2>/dev/null; do
+      sleep 30; waited=$((waited+30))
+      if [[ $(( waited % 300 )) -eq 0 ]]; then log "    …building $(basename "$repo") (${waited}s elapsed)"; fi
+      if [[ "$waited" -ge "${MAX_BUILD_WAIT:-5400}" ]]; then
+        log "    build exceeded ${MAX_BUILD_WAIT:-5400}s — killing pid $bp and continuing"
+        kill "$bp" 2>/dev/null || true; break
+      fi
+    done
+    build_rc=0; wait "$bp" 2>/dev/null || build_rc=$?
+    log "  build finished (exit $build_rc) for $(basename "$repo") — re-invoking claude to commit + open PR"
+    exec_out="$(cd "$repo" && ask_claude "The build the script ran for you finished with exit code $build_rc. Log tail:
+$(tail -40 "$blog" 2>/dev/null)
+
+Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. If the exit code was non-zero, fix the cause first. OUTPUT FORMAT: print every PR URL on separate lines at the end, the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop.")" || true
+    build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
+  done
+  rm -rf "$bdir" 2>/dev/null || true
+
   pr_url="$(printf '%s' "$exec_out" | grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -1)"
 
   if [[ "$pr_url" =~ ^https://github\.com/.+/pull/[0-9]+$ ]]; then
@@ -671,6 +720,19 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
     pr="$(state_get "$repo")"
     [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
 
+    # Guard: never classify a PR as RED when we couldn't actually READ its CI.
+    # A failed/rate-limited `gh pr view` (empty output) or a not-yet-populated
+    # rollup both yield an empty result; an empty rollup is neither green nor
+    # pending, which would otherwise fall through to RED and spend a plan-fix
+    # cycle on a PR that is actually fine. Treat "unreadable" as pending: skip
+    # this pass and retry next.
+    if ! gh pr view "$pr" --json statusCheckRollup \
+         --jq '.statusCheckRollup | length > 0' 2>/dev/null | grep -q '^true$'; then
+      log "$(basename "$repo"): CI status unavailable (transient gh error / no checks yet) — pending, retry next pass"
+      all_done=false
+      continue
+    fi
+
     if pr_is_green "$pr"; then
       log "$(basename "$repo"): GREEN $pr"
       continue
@@ -790,9 +852,11 @@ $fix_plan" "$repo")"
 target repo. If the target is one of the in-scope checkouts, cd there
 and push to its existing PR branch (do NOT open a new PR for it).
 
-Build and run the relevant tests locally before pushing (best effort — fall
-back to push + CI if the local toolchain can't build). For stellar-core,
-configure with \`--enable-next-protocol-version-unsafe-for-production\` first.
+Build + run tests locally ONLY if they finish quickly and synchronously in this
+turn. NEVER launch a long build/test as a background task and end your turn
+waiting for it — in -p mode you are NOT re-invoked, so it strands the run. Do
+NOT attempt a local stellar-core build (30-60 min) — rely on CI. ALWAYS commit
+and push before ending your turn.
 
 Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass is
 fine (expected when the CAP changes tx semantics or adds tests). Inspect the
@@ -801,8 +865,10 @@ reviewer — but still commit and continue, don't block.
 
 If the target is an UPSTREAM repo that does NOT yet have a PR in this
 run, clone it into $WORK_DIR/<owner>--<name>/, create a release-named
-branch, push, and open a draft PR. Cross-link the open PRs in the
-description.
+branch, push to your fork, and open a draft PR AGAINST THE UPSTREAM repo
+(cross-fork: \`gh pr create -R stellar/<repo> --base <base-branch> --head
+<fork-owner>:<branch>\`) — never fork-internal, never a synthetic base.
+Cross-link the open PRs in the description.
 
 PR DESCRIPTION STYLE (for any NEW PR you open here): keep it short,
 under 15 lines. '## Changes' / '## Deferred' bullets + upstream /
