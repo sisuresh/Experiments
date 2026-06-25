@@ -734,8 +734,12 @@ name the upstream repo + PR URL in your plan.
 VERDICT FORMAT (machine-parsed): the FIRST non-empty line of your reply
 must be one of:
   - SKIP         — failure is non-blocking (tracker workflow, fork-secrets
-                   issue, etc.) or the fix is waiting on a different
-                   upstream that isn't yet green. Add the reasoning below.
+                   issue, etc.), the fix is waiting on a different upstream
+                   that isn't yet green, OR it needs a stellar-core deb/image
+                   not published yet — check the apt pool + unsafe-stellar-core
+                   docker repo for an artifact whose commit matches the core
+                   PR HEAD (see lessons.md), SKIP and re-check next pass until
+                   it appears. Add the reasoning below.
   - FIX          — there's actionable work to do. Plan the edits below.
   - INVESTIGATE  — you need another reading pass to be confident in a
                    SKIP/FIX. Write up what you've checked and what's

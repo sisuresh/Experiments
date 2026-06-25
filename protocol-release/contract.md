@@ -18,9 +18,13 @@ own; this document is just the shape of the work.
 The driving prompt should supply:
 
 - The new protocol number.
-- The canonical `stellar/stellar-xdr` commit the release pins.
+- The CAP's XDR changes (from the CAP's "XDR Changes" section). If they
+  aren't in `stellar-xdr` yet, the flow authors them on `main` gated behind a
+  feature `#ifdef` (see `lessons.md`); if already in, just the canonical
+  commit it pins.
 - Any per-CAP feature flags the release expects to enable / drop (these
-  determine the `XDR_FEATURES` lists in downstream regens).
+  determine the `XDR_FEATURES` lists in downstream regens, and must match the
+  flag name used in the `.x` `#ifdef`).
 
 That's it. The SPIKE PRs the LLM opens for `rs-stellar-xdr`,
 `rs-soroban-env`, and `stellar-core` will themselves produce the
@@ -74,8 +78,9 @@ stellar-prometheus-exporter, supercluster.
 
 **Land order:**
 
-1. `stellar-xdr` — release manager ungates new CAPs if needed (usually
-   already in by the time the LLM starts)
+1. `stellar-xdr` — if the CAP's types aren't in yet, author them on `main`
+   gated behind a feature `#ifdef` (see `lessons.md`); otherwise confirm the
+   pinned commit. `curr`/`next` regenerate automatically.
 2. `rs-stellar-xdr` — XDR regen, version bump
 3. `rs-soroban-env` — host code + xdr dep bump, version bump
 4. `stellar-core` — submodule + Cargo bumps, protocol + overlay version
@@ -202,9 +207,15 @@ the exemplar, plus that repo's `lessons.md` section.
   tx semantics or adds tests. Inspect the JSON diff; if a tx changes that you
   did not expect, flag it in the PR for the reviewer, but still commit and
   continue. Human review catches it downstream.
-- **The vnext core image is a manual Jenkins handoff.** A downstream red whose
-  cause is a missing protocol-N `-vnext` image is `SKIP`, not a fix: wait for
-  the operator to trigger the build, then resume.
+- **stellar-core deb/image artifacts lag the PR — monitor and wait by commit.**
+  The Jenkins build is triggered manually, but its outputs are detected
+  automatically. Any step depending on a core deb/image (e.g. the horizon/rpc
+  integration matrix legs) must wait for the artifact whose embedded commit
+  matches the core PR HEAD: each watch pass re-checks the apt pool and
+  `unsafe-stellar-core` docker repo (commands + naming in `lessons.md`). A
+  downstream red caused by the artifact not existing yet is `SKIP`, not a fix.
+  Only once the matching artifact appears, pin the downstream deb/image to it
+  and proceed.
 
 ---
 

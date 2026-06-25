@@ -21,8 +21,24 @@ When a CAP-71-merged host releases on crates.io, the pre-release `git=` pins fli
    curl -s "https://hub.docker.com/v2/repositories/stellar/unsafe-stellar-core/tags/?page_size=100&name=vnext" | jq '.results[].name'
    ```
    This is exactly where the first p28-cap-0083 horizon PR deferred v28 fixture generation — the image was right there with `-vnext`.
+- **Wait for the matching-commit artifact before bumping any core deb/image pin.** Core's deb + docker artifacts are published *after* a (manually-triggered) Jenkins build, so they lag the PR — you have to wait for them. Both embed the build's git commit: docker tag `<ver>-<build>.<commit>.<distro>-vnext` (e.g. `…6e768de7a.jammy-vnext`); deb `stellar-core_<ver>-<build>.<commit>.<distro>~vnext_amd64.deb` at <https://apt.stellar.org/pool/unstable/s/stellar-core/>. The `<commit>` token (7–9-char short SHA) must be a prefix of the core PR's HEAD SHA — pin to *that* build, not the newest `-vnext`. If no matching artifact exists yet the build isn't done: keep polling both sources each watch pass, and don't bump the downstream deb/image pin until it appears.
+   ```
+   curl -s "https://hub.docker.com/v2/repositories/stellar/unsafe-stellar-core/tags/?page_size=100&name=vnext" | jq -r '.results[].name'  # docker tags
+   curl -s https://apt.stellar.org/pool/unstable/s/stellar-core/ | grep -oE 'stellar-core[^"<]*\.deb'                                      # debs
+   ```
+   Then grep both outputs for the core PR's short commit.
 - **Match the previous-protocol's package/image *variant* when bumping.** stellar-core ships in a few build flavors: plain (`...jammy`), buildtests (`...jammy~buildtests`, assertions enabled — slower), and vnext (`...jammy~vnext`) / vnext-buildtests (`...jammy~vnext~buildtests`). Docker repos similarly split between `stellar/stellar-core` (release) and `stellar/unsafe-stellar-core` (prerelease/vnext-only). When you add a new-protocol leg, look at the *previous* protocol's pin and mirror its choices — if the previous leg used plain (no `~buildtests`), the new leg should use plain-vnext (`...jammy~vnext`), NOT vnext-buildtests. Mixing variants silently changes test pacing (the buildtests flavor's assertion overhead is enough to make backfill/timing-sensitive tests miss their polling deadlines). The docker repo (`stellar-core` vs `unsafe-stellar-core`) is the only thing you may have to switch — vnext tags only live on `unsafe-stellar-core`.
 - **`dependency-sanity-checker` failures on protocol-next PRs are EXPECTED, not blockers.** stellar-rpc's `scripts/check-dependencies.bash` enforces *steady-state* invariants (single source per crate@version, exact Go/Rust stellar-xdr match, `p{N}-expect.txt` present for every matrix leg). During a protocol-next transition all three of those temporarily break for well-understood reasons: `-prev` and `-curr` may legitimately come from different sources (registry vs git rev) at the same `crate@version`; Go's stellar-xdr regenerates as soon as the CAP's XDR lands while rs-stellar-xdr lags by 1-2 commits; new-protocol `p{N}-expect.txt` ships alongside the host bump, not before. **Do not patch the script to silence these.** The maintainer expects to see the failures in CI output, the `dependency-sanity-checker` check is not a merge blocker on a protocol-next PR, and any "fix" to the script papers over real divergences. The protocol-release loop respects this via `IGNORED_CHECKS=dependency-sanity-checker,complete` (default) — both checks are filtered from `pr_is_green` / `failure_signal`, so the watch loop won't burn plan-review cycles trying to fix them. (Lost ~3 cycles patching this script before settling on revert + ignore.)
+
+---
+
+## stellar-xdr (canonical `.x` — source of truth)
+
+All edits go on the **`main`** branch. `curr` (no features enabled) and `next` (all features enabled) are auto-generated from `main` by a GitHub Action (`stellar-xdr xfile preprocess`) on every push — **never commit to `curr`/`next` directly**.
+
+- **Gate every new CAP definition behind a preprocessor flag named after the feature**, e.g. `#ifdef CAP73_SAC_CREATE_ACCOUNTS … #endif`. Gated defs appear only in `next` until the feature is enabled for the release; ungated defs also land in `curr`.
+- Protocol changes (anything transitively touching `LedgerEntry`/`LedgerHeader`/`TransactionEnvelope`/`StellarValue`) stay gated in `next` until core bumps the max supported protocol.
+- **The flag token is the contract with every downstream regen:** whatever you name it here is exactly what all downstream `--features` / `XDR_FEATURES` lists must pass (cf. rs-stellar-xdr `cap_<n>`, the go/js `xfile preprocess` steps).
 
 ---
 
@@ -31,6 +47,7 @@ When a CAP-71-merged host releases on crates.io, the pre-release `git=` pins fli
 ### `stellar/rs-stellar-xdr`
 Anchor of the Rust XDR. The CAP-71 era introduced a per-cap-feature layout — there is no `curr` module any more; everything is at the crate root, gated by `cap_<n>` features. So:
 
+- **Regen:** the `.x` source is the `xdr/` git submodule (not a Cargo/Makefile pin) — bump it to the new stellar-xdr commit, add the new `cap_<n>` feature in `Cargo.toml`, then `make generate` (rewrites `src/generated*`).
 - `features = ["curr", ...]` → `features = ["cap_<n>", ...]` (use the right cap).
 - All `use stellar_xdr::curr::*;` in downstream Rust → `use stellar_xdr::*;`.
 - `xdr2json/src/lib.rs` in rpc has its own `use stellar_xdr::curr as xdr;` — flip to `use stellar_xdr as xdr;`.
