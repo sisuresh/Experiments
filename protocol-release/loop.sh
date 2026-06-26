@@ -543,6 +543,12 @@ EACH repo named in the plan:
 
 OPERATING MODE (do not deviate):
 
+- START FROM A FRESH BASE: before any edits, fetch the upstream and check out
+  this repo's base branch (main/master for the gated layers, protocol-next for
+  go-stellar-sdk/horizon/rpc — see lessons.md), fast-forward it to the latest
+  upstream, and create the release branch from it. If the release branch already
+  exists locally from a prior run, delete and recreate it from the fresh base —
+  never build on leftover local state.
 - ALWAYS open every PR against the UPSTREAM repo (e.g. \`stellar/<repo>\`) as a
   cross-fork PR: push the branch to your fork, then
   \`gh pr create -R stellar/<repo> --base <base-branch> --head <fork-owner>:<branch>\`.

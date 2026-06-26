@@ -111,7 +111,10 @@ working session, then productionize as upstreams merge.
 
 ## Per-repo PR mechanics
 
-For each repo, the same loop applies:
+For each repo, the same loop applies (always **starting from the latest
+relevant base branch** — `git fetch`, check out the base per the
+base-branch-by-layer rule, fast-forward to the latest upstream, and create the
+release branch from it; never reuse a stale local release branch):
 
 1. **Find the pin file(s)** — typically one of:
    - `Cargo.toml` workspace deps (Rust)
