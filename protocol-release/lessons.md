@@ -38,7 +38,7 @@ When a CAP-71-merged host releases on crates.io, the pre-release `git=` pins fli
 
 All edits go on the **`main`** branch. `curr` (no features enabled) and `next` (all features enabled) are auto-generated from `main` by a GitHub Action (`stellar-xdr xfile preprocess`) on every push — **never commit to `curr`/`next` directly**.
 
-- **Gate every new CAP definition behind a preprocessor flag named after the feature**, e.g. `#ifdef CAP73_SAC_CREATE_ACCOUNTS … #endif`. Gated defs appear only in `next` until the feature is enabled for the release; ungated defs also land in `curr`.
+- **Gate every new CAP definition behind a preprocessor flag whose name is the CAP number PLUS a short title — not a bare `cap_0083`, which is opaque.** Use `CAP_<n>_<SHORT_TITLE>`, e.g. `#ifdef CAP_0083_SKIP_LEDGER` or `#ifdef CAP_0084_MUXED_CONTRACT` (cf. `CAP73_SAC_CREATE_ACCOUNTS`). The title makes the flag self-documenting everywhere it surfaces (the `.x`, downstream `--features`, the rs-stellar-xdr crate feature, go/js `XDR_FEATURES`). Gated defs appear only in `next` until the feature is enabled for the release; ungated defs also land in `curr`.
 - Protocol changes (anything transitively touching `LedgerEntry`/`LedgerHeader`/`TransactionEnvelope`/`StellarValue`) stay gated in `next` until core bumps the max supported protocol.
 - **The flag token is the contract with every downstream regen:** whatever you name it here is exactly what all downstream `--features` / `XDR_FEATURES` lists must pass (cf. rs-stellar-xdr `cap_<n>`, the go/js `xfile preprocess` steps).
 
