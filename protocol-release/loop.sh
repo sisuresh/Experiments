@@ -88,6 +88,12 @@ CONTRACT="${CONTRACT:-$SCRIPT_DIR/contract.md}"
 LESSONS="$SCRIPT_DIR/lessons.md"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-4-8}"
 REVIEWER_MODEL="${REVIEWER_MODEL:-gpt-5.5}"
+# Per-repo claude reasoning effort. Most repos use DEFAULT_EFFORT; the heavy
+# reasoning repos in MAX_EFFORT_REPOS use 'max'. Passed to `claude --effort`,
+# which overrides any inherited CLAUDE_EFFORT/settings default.
+DEFAULT_EFFORT="${DEFAULT_EFFORT:-high}"
+MAX_EFFORT_REPOS="${MAX_EFFORT_REPOS:-rs-soroban-env stellar-core}"
+REPO_EFFORT="$DEFAULT_EFFORT"   # current repo's effort; reset per repo below
 MAX_WATCH_ITERS="${MAX_WATCH_ITERS:-60}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-120}"
 # Cap on plan-revise rounds inside plan_then_review (was 2; 3 gives the
@@ -213,10 +219,20 @@ state_set() {  # state_set <repo-path> <value>
 # Each call streams the model's output to a per-call file under $LOG_DIR so
 # the operator can `tail -f` to watch live. The script-level `exec 2>&1` to
 # tee logs the file path to the main runlog the moment the call starts.
+# Effort level for a repo: 'max' for MAX_EFFORT_REPOS (matches either the bare
+# name or an <owner>--<name> workdir clone), else DEFAULT_EFFORT.
+effort_for_repo() {
+  local name r; name="$(basename "$1")"
+  for r in $MAX_EFFORT_REPOS; do
+    [[ "$name" == "$r" || "$name" == *"--$r" ]] && { printf 'max'; return; }
+  done
+  printf '%s' "$DEFAULT_EFFORT"
+}
+
 ask_claude() {
   local f="$LOG_DIR/${ts}-claude-$(date +%H%M%S)-$RANDOM.txt"
-  log "  → claude ($CLAUDE_MODEL) streaming. Watch: tail -f $f"
-  claude --model "$CLAUDE_MODEL" -p "$1" | tee "$f"
+  log "  → claude ($CLAUDE_MODEL, effort=${REPO_EFFORT:-$DEFAULT_EFFORT}) streaming. Watch: tail -f $f"
+  claude --model "$CLAUDE_MODEL" --effort "${REPO_EFFORT:-$DEFAULT_EFFORT}" -p "$1" | tee "$f"
 }
 ask_copilot_gpt() {
   local f="$LOG_DIR/${ts}-copilot-$(date +%H%M%S)-$RANDOM.txt"
@@ -496,6 +512,7 @@ pr_is_pending() {
 open_pr_for_repo() {
   local repo="$1"
   local existing plan pr_url
+  REPO_EFFORT="$(effort_for_repo "$repo")"
   existing="$(state_get "$repo")"
   if [[ -n "$existing" && "$existing" != "ESCALATED" ]]; then
     log "Skipping $(basename "$repo") — already open at $existing"
@@ -719,6 +736,7 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
   for repo in "${SCOPE[@]}"; do
     pr="$(state_get "$repo")"
     [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
+    REPO_EFFORT="$(effort_for_repo "$repo")"
 
     # Guard: never classify a PR as RED when we couldn't actually READ its CI.
     # A failed/rate-limited `gh pr view` (empty output) or a not-yet-populated
