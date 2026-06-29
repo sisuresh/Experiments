@@ -60,7 +60,7 @@
 #                     which covers most slow CI matrices (horizon integration
 #                     tests, full Rust+Cargo builds, multi-protocol runs).
 #   WATCH_INTERVAL    Sleep between watch passes, seconds (default: 120)
-#   MAX_REVIEW_ROUNDS Plan-revise rounds in plan_then_review (default: 3).
+#   MAX_REVIEW_ROUNDS Plan-revise rounds in plan_then_review (default: 1).
 #   MAX_INVESTIGATE_ROUNDS  Cap on INVESTIGATE verdicts before forcing a
 #                     decision (default: 3).
 #   MAX_SAME_FAIL_RETRIES   Same-signature retries before ESCALATE (default: 3).
@@ -96,9 +96,9 @@ MAX_EFFORT_REPOS="${MAX_EFFORT_REPOS:-rs-soroban-env stellar-core}"
 REPO_EFFORT="$DEFAULT_EFFORT"   # current repo's effort; reset per repo below
 MAX_WATCH_ITERS="${MAX_WATCH_ITERS:-60}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-120}"
-# Cap on plan-revise rounds inside plan_then_review (was 2; 3 gives the
-# reviewer one extra chance to push back before the script commits).
-MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-3}"
+# Cap on plan-revise rounds inside plan_then_review. Default 1: a single
+# copilot review pass (+ at most one revise), then proceed — favors speed.
+MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-1}"
 # Cap on consecutive INVESTIGATE verdicts before forcing a SKIP/FIX
 # decision. INVESTIGATE lets the planner take extra turns reading code
 # before producing a fix; cap prevents indefinite digging.
@@ -614,7 +614,7 @@ $plan")" || true
     exec_out="$(cd "$repo" && ask_claude "The build the script ran for you finished with exit code $build_rc. Log tail:
 $(tail -40 "$blog" 2>/dev/null)
 
-Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. If the exit code was non-zero, fix the cause first. OUTPUT FORMAT: print every PR URL on separate lines at the end, the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop.")" || true
+Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. If the exit code was non-zero, fix the cause first. The cause may be UPSTREAM, not this repo — if the failure traces to an upstream repo (one earlier in the dep chain, whose PR is already open this run), \`cd\` to that upstream repo, push the fix to its EXISTING PR branch (do NOT open a new PR for it), re-pin THIS repo to the upstream's new head, then request another build. OUTPUT FORMAT: print every PR URL on separate lines at the end (including any upstream PR you pushed to), the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop.")" || true
     build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
   done
   rm -rf "$bdir" 2>/dev/null || true

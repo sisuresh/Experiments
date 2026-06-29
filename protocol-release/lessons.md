@@ -51,6 +51,7 @@ All edits go on the **`main`** branch. `curr` (no features enabled) and `next` (
 Anchor of the Rust XDR. The CAP-71 era introduced a per-cap-feature layout — there is no `curr` module any more; everything is at the crate root, gated by `cap_<n>` features. So:
 
 - **Regen:** the `.x` source is the `xdr/` git submodule (not a Cargo/Makefile pin) — bump it to the new stellar-xdr commit, add the new `cap_<n>` feature in `Cargo.toml`, then `make generate` (rewrites `src/generated*`).
+- **Locally, run ONLY `make generate` and commit it — do NOT run `make build` / `make test`.** Those run `cargo-hack --feature-powerset` (clippy + test across ~144 feature combinations × 2 toolchains), which is ~80 min serial on one machine and just duplicates CI (CI fans the same powerset out across parallel runners). This repo is an **exception to the build+test-locally rule**: regenerate, commit, push, and let CI run the matrix. (If you want a quick local sanity check, `cargo build --features <cap_token>,std` is enough — never the full powerset.)
 - `features = ["curr", ...]` → `features = ["cap_<n>", ...]` (use the right cap).
 - All `use stellar_xdr::curr::*;` in downstream Rust → `use stellar_xdr::*;`.
 - `xdr2json/src/lib.rs` in rpc has its own `use stellar_xdr::curr as xdr;` — flip to `use stellar_xdr as xdr;`.
@@ -74,6 +75,8 @@ When bumping the env-common dep: drop the `=26.1.x` version pin (the rev's packa
 ## stellar-core (validator — consensus/host layer)
 
 Build next-protocol code paths + tests with `./configure --enable-next-protocol-version-unsafe-for-production` (also required to re-record the `-next` TxMeta baseline and to capture `test-lcm-next/` meta).
+
+- **Build with `make -j$(nproc)` — NEVER bare `make -j`.** stellar-core is a huge C++ codebase plus the multi-version Rust soroban (p21…p28, each a full build); unbounded `-j` spawns hundreds of compilers at once and exhausts memory, hanging the machine. Always cap to the core count: `make -j$(nproc)`.
 
 - **Protocol bump:** `Config::CURRENT_LEDGER_PROTOCOL_VERSION` in `src/main/Config.cpp`; named version constants in `src/util/ProtocolVersion.h` (CAP-0083 = `EMPTY_TX_SET_PROTOCOL_VERSION = V_28`). Gate CAP code with `protocolVersionStartsFrom(ledgerVersion, <X>_PROTOCOL_VERSION)`.
 - **Per-protocol soroban host submodule — CREATE `p<N>`, never bump `p<N-1>`.** Core embeds a *separate* rs-soroban-env submodule per protocol (`src/rust/soroban/p21`…`p<N-1>`, each its own `.gitmodules` entry → `rs-soroban-env`) so old protocols keep replaying against their original host. When updating the host for protocol N, **create a new `src/rust/soroban/p<N>` submodule** pointing at the CAP host commit, add the matching `.gitmodules` entry, and wire it into the build (`Makefile.am` multi-soroban linking) mirroring how `p<N-1>` is referenced. **Do NOT bump the previous protocol's submodule** (e.g. don't touch `p27` for a p28 change — that both targets the wrong protocol and mutates released p27 behavior). Learn the exact add-pattern from history: `git log --oneline -- 'src/rust/soroban/p*'` (e.g. "Add p26 module", "create p25 submodule", and the foundational "Reorganize multiple-soroban linking around rlibs and submodules").
