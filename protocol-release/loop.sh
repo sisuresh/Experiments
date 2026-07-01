@@ -108,17 +108,23 @@ MAX_INVESTIGATE_ROUNDS="${MAX_INVESTIGATE_ROUNDS:-3}"
 # occurrence); 3 lets the planner try 3 fixes for the same signature
 # before giving up.
 MAX_SAME_FAIL_RETRIES="${MAX_SAME_FAIL_RETRIES:-3}"
-# CI checks that legitimately fail on protocol-next PRs and shouldn't block
-# the watch loop from declaring a PR green or trigger plan-review:
-#   - dependency-sanity-checker: enforces steady-state invariants (single
-#     source per crate@version, exact Go/Rust stellar-xdr match, p{N}-expect.txt
-#     present) that are temporarily violated mid-transition. Failure is
-#     expected during a protocol-next bump.
-#   - complete: the rollup workflow that aggregates required-status-check
-#     results; if dependency-sanity-checker is among its required inputs,
-#     it fails as a consequence.
+# IGNORED_CHECKS is NOT a list of "expected to fail" checks — deciding whether
+# a failure is expected is now the planner's job (see the watch-loop verdict
+# prompt: for EVERY failing check it judges "should this be green at this point
+# in the release, or is it expected to stay red until a later step lands?").
+#
+# This list is ONLY for derivative checks that carry no independent signal —
+# pure aggregators whose failure is fully explained by another check:
+#   - complete: the rollup workflow that just ANDs the required checks; it
+#     fails as a mechanical consequence of any input failing, so surfacing it
+#     is noise, not information. The planner judges the underlying checks.
+# Everything else — including dependency-sanity-checker and check-git-rev-deps,
+# which are usually expected to fail mid-transition but CAN also fail for real
+# (missing p{N}-expect.txt, a typo'd rev) — reaches the planner so it can tell
+# expected-now from actually-broken. Override via env to widen the fast-path
+# for a release where you already know certain checks are non-actionable.
 # Build a JSON array form for jq's --argjson.
-IGNORED_CHECKS="${IGNORED_CHECKS:-dependency-sanity-checker,complete}"
+IGNORED_CHECKS="${IGNORED_CHECKS:-complete}"
 IGNORED_CHECKS_JSON="$(printf '%s' "$IGNORED_CHECKS" | jq -R 'split(",") | map(select(length > 0))')"
 STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/protocol-release-loop}"
 LOG_DIR="${LOG_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/protocol-release-loop/logs}"
@@ -251,10 +257,14 @@ open_prs_context() {
       printf -- '- %s: %s\n' "$repo" "${url:-NOT-YET-OPENED}"
       continue
     fi
-    status="$(gh pr view "$url" --json statusCheckRollup \
-      --jq '[.statusCheckRollup[]? | .conclusion // .status] | unique | tostring' 2>/dev/null \
-      || echo '[?]')"
-    printf -- '- %s: %s status=%s\n' "$repo" "$url" "$status"
+    # Include the PR's merge state (OPEN/MERGED/CLOSED), not just check status:
+    # the planner needs it to judge whether a downstream failure is "expected
+    # now, waiting on this still-OPEN upstream" vs "this upstream MERGED, so
+    # propose the repin now".
+    status="$(gh pr view "$url" --json state,statusCheckRollup \
+      --jq '"\(.state) checks=\([.statusCheckRollup[]? | .conclusion // .status] | unique | tostring)"' 2>/dev/null \
+      || echo 'UNKNOWN')"
+    printf -- '- %s: %s [%s]\n' "$repo" "$url" "$status"
   done
 }
 
@@ -424,30 +434,40 @@ failure_signal() {
   local pr="$1"
   local failing_jobs fail_job_url nwo job_id log_excerpt
 
-  # First: enumerate ALL failing jobs by name + URL so the planner can
-  # judge whether they're real CI failures or non-blocking tracker
-  # workflows (update-completed-on-issue-closed, move-to-done, etc).
-  # Apply $IGNORED_CHECKS so the planner never sees checks that are
-  # expected to fail on protocol-next (dep-sanity-checker, etc.).
+  # First: enumerate EVERY genuinely-failing check (terminal non-pass state)
+  # by name + state + URL, sorted by name, so the planner can judge each one
+  # ("should this be green now, or expected to stay red until a later step?").
+  # $IGNORED_CHECKS drops only derivative aggregators (e.g. `complete`) — the
+  # planner sees all real failures, including ones usually expected to fail.
   failing_jobs="$(gh pr view "$pr" --json statusCheckRollup --jq \
     --argjson ignored "$IGNORED_CHECKS_JSON" \
     '[.statusCheckRollup[]?
-      | select(.conclusion == "FAILURE")
       | select(((.name // .context // "") | tostring) as $n | ($ignored // []) | index($n) | not)
-      | "  - \((.name // .context)): \(.detailsUrl // "")"][:8] | join("\n")' 2>/dev/null)"
+      | {n: (.name // .context // "?"),
+         s: (if (.conclusion // "") != "" then .conclusion
+              elif (.status // "") != "" and .status != "COMPLETED" then .status
+              elif (.state // "") != "" then .state else "UNKNOWN" end),
+         u: (.detailsUrl // "")}
+      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE"))]
+      | sort_by(.n) | map("  - \(.n) [\(.s)]: \(.u)")[:12] | join("\n")' 2>/dev/null)"
 
   if [[ -n "$failing_jobs" ]]; then
-    printf 'Failing jobs on this PR (judge whether any are non-blocking tracker workflows):\n%s\n' "$failing_jobs"
+    printf 'Failing checks on this PR. For EACH, decide: should it be green at this point in the release, or is it expected to stay red until a later step in this run lands?\n%s\n' "$failing_jobs"
   fi
 
-  # Then: try to pull a log excerpt from the first failing job for context.
-  # Same ignore-filter so we don't pull logs from an expected-failing check.
+  # Then: pull a log excerpt from the first failing check (sorted by name, same
+  # ignore-filter) for context.
   fail_job_url="$(gh pr view "$pr" --json statusCheckRollup --jq \
     --argjson ignored "$IGNORED_CHECKS_JSON" \
     '[.statusCheckRollup[]?
-      | select(.conclusion == "FAILURE")
       | select(((.name // .context // "") | tostring) as $n | ($ignored // []) | index($n) | not)
-      | .detailsUrl][0] // empty' 2>/dev/null)"
+      | {n: (.name // .context // "?"),
+         s: (if (.conclusion // "") != "" then .conclusion
+              elif (.status // "") != "" and .status != "COMPLETED" then .status
+              elif (.state // "") != "" then .state else "UNKNOWN" end),
+         u: (.detailsUrl // "")}
+      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE"))]
+      | sort_by(.n) | (.[0].u) // empty' 2>/dev/null)"
   if [[ -n "$fail_job_url" ]]; then
     job_id="$(echo "$fail_job_url" | grep -oE '/job/[0-9]+' | grep -oE '[0-9]+')"
     nwo="$(echo "$fail_job_url" | grep -oE 'github.com/[^/]+/[^/]+' | cut -d/ -f2-3)"
@@ -466,6 +486,24 @@ failure_signal() {
       fi
     fi
   fi
+}
+
+# A STABLE signature of a PR's failing checks: sorted "name[state]" with NO
+# URLs. detailsUrl embeds run/job IDs that change on every CI re-run, so a
+# URL-based signature would bust the SKIP cache on every benign re-run. This
+# changes only when the SET of failing checks (or their states) changes —
+# which is exactly when the planner should re-evaluate.
+failure_sig() {
+  gh pr view "$1" --json statusCheckRollup --jq \
+    --argjson ignored "$IGNORED_CHECKS_JSON" \
+    '[.statusCheckRollup[]?
+      | select(((.name // .context // "") | tostring) as $n | ($ignored // []) | index($n) | not)
+      | {n: (.name // .context // "?"),
+         s: (if (.conclusion // "") != "" then .conclusion
+              elif (.status // "") != "" and .status != "COMPLETED" then .status
+              elif (.state // "") != "" then .state else "UNKNOWN" end)}
+      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE"))
+      | "\(.n)[\(.s)]"] | sort | join(",")' 2>/dev/null || true
 }
 
 # Normalize one statusCheckRollup node to a single string state.
@@ -504,6 +542,35 @@ pr_is_pending() {
     --argjson ignored "$IGNORED_CHECKS_JSON" \
     "$_check_state_jq"' | any(. == "PENDING" or . == "QUEUED" or . == "IN_PROGRESS" or . == "EXPECTED" or . == "UNKNOWN")' \
     2>/dev/null | grep -q '^true$'
+}
+
+# Classify a PR's CI from a SINGLE rollup fetch (retried on a failed/empty
+# fetch — transient gh error or secondary rate limit). Echoes exactly one of:
+#   GREEN   — all (non-ignored) checks SUCCESS/NEUTRAL/SKIPPED
+#   PENDING — at least one check still running/queued (or no checks yet)
+#   RED     — a real failure, nothing pending
+#   UNKNOWN — couldn't read CI after retries (caller treats as pending, NEVER red)
+# This supersedes calling pr_is_green + pr_is_pending separately: those did two
+# independent gh calls, so the watch-start gh burst could break one but not the
+# other and a green PR got misclassified RED. One fetch removes that race.
+pr_status() {
+  local pr="$1" rollup states t
+  rollup=""
+  for t in 1 2 3; do
+    rollup="$(gh pr view "$pr" --json statusCheckRollup 2>/dev/null)"
+    [[ -n "$rollup" ]] && break
+    sleep 5
+  done
+  [[ -z "$rollup" ]] && { echo UNKNOWN; return; }
+  states="$(printf '%s' "$rollup" | jq -r --argjson ignored "$IGNORED_CHECKS_JSON" "$_check_state_jq | .[]?" 2>/dev/null)"
+  [[ -z "$states" ]] && { echo PENDING; return; }
+  if printf '%s\n' "$states" | grep -qE '^(PENDING|QUEUED|IN_PROGRESS|EXPECTED|UNKNOWN)$'; then
+    echo PENDING; return
+  fi
+  if printf '%s\n' "$states" | grep -qvE '^(SUCCESS|NEUTRAL|SKIPPED)$'; then
+    echo RED; return
+  fi
+  echo GREEN
 }
 
 # Open a draft PR for a repo: plan_then_review + claude executes. Records
@@ -744,28 +811,23 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
     [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
     REPO_EFFORT="$(effort_for_repo "$repo")"
 
-    # Guard: never classify a PR as RED when we couldn't actually READ its CI.
-    # A failed/rate-limited `gh pr view` (empty output) or a not-yet-populated
-    # rollup both yield an empty result; an empty rollup is neither green nor
-    # pending, which would otherwise fall through to RED and spend a plan-fix
-    # cycle on a PR that is actually fine. Treat "unreadable" as pending: skip
-    # this pass and retry next.
-    if ! gh pr view "$pr" --json statusCheckRollup \
-         --jq '.statusCheckRollup | length > 0' 2>/dev/null | grep -q '^true$'; then
-      log "$(basename "$repo"): CI status unavailable (transient gh error / no checks yet) — pending, retry next pass"
-      all_done=false
-      continue
-    fi
-
-    if pr_is_green "$pr"; then
-      log "$(basename "$repo"): GREEN $pr"
-      continue
-    fi
-    if pr_is_pending "$pr"; then
-      log "$(basename "$repo"): pending $pr"
-      all_done=false
-      continue
-    fi
+    # Classify CI from a SINGLE rollup fetch (retried on transient failure).
+    # One fetch (not separate pr_is_green/pr_is_pending calls) so the
+    # watch-start gh burst can't break one check but not the other and
+    # misread a green PR as RED. Unreadable CI is treated as pending, never RED.
+    case "$(pr_status "$pr")" in
+      GREEN)
+        log "$(basename "$repo"): GREEN $pr"
+        continue ;;
+      PENDING)
+        log "$(basename "$repo"): pending $pr"
+        all_done=false
+        continue ;;
+      UNKNOWN)
+        log "$(basename "$repo"): CI unreadable (transient gh error / rate limit) — retry next pass $pr"
+        all_done=false
+        continue ;;
+    esac
 
     # Red.
     all_done=false
@@ -773,7 +835,11 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
 
     fail_log="$(failure_signal "$pr")"
     [[ -z "$fail_log" ]] && fail_log="(no failure signal extracted — inspect $pr manually)"
-    fail_sig="$(printf '%s' "$fail_log" | head -3)"
+    # Stable cache key: the SET of failing checks, not the log text (whose URLs
+    # carry run/job IDs that change every re-run). Fall back to the log head if
+    # no terminal-failure check parsed (e.g. a state we don't enumerate).
+    fail_sig="$(failure_sig "$pr")"
+    [[ -z "$fail_sig" ]] && fail_sig="$(printf '%s' "$fail_log" | head -3)"
 
     # Sticky-SKIP short-circuit: if this PR was previously verdicted SKIP
     # and the failure signature hasn't changed, don't burn another
@@ -811,26 +877,40 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
     # turns before committing to FIX/SKIP. Cap at MAX_INVESTIGATE_ROUNDS.
     fix_task="CI is red on $pr ($(basename "$repo")).
 
-Failing-job log excerpt (with surrounding context):
 $fail_log
+
+GENERAL PRINCIPLE — judge each failing check against the state of THIS
+release. Use 'Open PRs in this run' above: which in-scope PRs are still
+OPEN vs already MERGED, plus the dependency layering in the contract.
+For EACH failing check, classify it:
+  • EXPECTED-NOW — it can only go green after a later step in this run
+    that hasn't happened yet. Examples: a git-rev / codegen / dependency
+    check failing because it points at an in-scope upstream PR that's
+    still OPEN; a check needing a stellar-core deb/image not yet published
+    (check the apt pool + unsafe-stellar-core docker repo for an artifact
+    whose commit matches the core PR HEAD — see lessons.md); a downstream
+    check waiting on an unmerged XDR change. A non-blocking tracker /
+    fork-secrets workflow also counts as expected-now.
+  • ACTIONABLE-NOW — the work it depends on is already in place and it's
+    genuinely broken. Examples: this PR's own unit tests, fmt/lint, a
+    compile error in code that depends on nothing unmerged, a generated
+    file you can regenerate now, a repin you can do now because the
+    upstream it points at has ALREADY MERGED (shown above).
+Once an upstream a check was waiting on has MERGED, that check flips from
+expected-now to actionable-now — propose the repin/regen that makes it pass.
 
 The fix may belong here OR in an UPSTREAM PR in this run. If upstream,
 name the upstream repo + PR URL in your plan.
 
 VERDICT FORMAT (machine-parsed): the FIRST non-empty line of your reply
 must be one of:
-  - SKIP         — failure is non-blocking (tracker workflow, fork-secrets
-                   issue, etc.), the fix is waiting on a different upstream
-                   that isn't yet green, OR it needs a stellar-core deb/image
-                   not published yet — check the apt pool + unsafe-stellar-core
-                   docker repo for an artifact whose commit matches the core
-                   PR HEAD (see lessons.md), SKIP and re-check next pass until
-                   it appears. Add the reasoning below.
-  - FIX          — there's actionable work to do. Plan the edits below.
-  - INVESTIGATE  — you need another reading pass to be confident in a
-                   SKIP/FIX. Write up what you've checked and what's
-                   still unknown; the script will re-invoke you with
-                   the partial findings as context.
+  - SKIP         — EVERY failing check is expected-now. State which later
+                   step each one is waiting on; the script re-checks next pass.
+  - FIX          — at least one failing check is actionable-now. Plan the
+                   edits below (a repin/regen counts as a fix).
+  - INVESTIGATE  — you need another reading pass to classify a check. Write
+                   what you've checked and what's still unknown; the script
+                   re-invokes you with these findings.
 The script greps line 1 for the verdict — put it there."
 
     fix_plan="$(plan_then_review "$fix_task" "$repo")"
