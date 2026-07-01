@@ -576,6 +576,48 @@ pr_status() {
 # Open a draft PR for a repo: plan_then_review + claude executes. Records
 # the resulting PR URL (or ESCALATED) in state. Adds the repo to SCOPE if
 # it wasn't already.
+# Service a RUN_BUILD: handoff from an execute step. Claude emits
+# `RUN_BUILD: <cmd>` as its last line instead of running a long build itself (a
+# -p turn is never re-invoked, so a backgrounded build would strand the run);
+# the SCRIPT runs it in $repo — no turn limit — waits (heartbeat every 5 min,
+# hard cap MAX_BUILD_WAIT), then re-invokes claude with the exit code + log tail
+# plus $reinvoke to finish. Loops if claude requests another build, up to
+# MAX_BUILD_CYCLES. Returns via global RUN_BUILD_RESULT (not stdout — the loop
+# calls ask_claude repeatedly). If no build was requested, RUN_BUILD_RESULT is
+# the input exec_out unchanged. Builds run IN-TREE in $repo, so autotools
+# objects + ccache persist across runs and rebuilds are incremental.
+run_build_handoff() {
+  local repo="$1" exec_out="$2" reinvoke="$3"
+  local blog build_cmd build_rc bcycle bp waited
+  blog="$(mktemp "${TMPDIR:-/tmp}/prl-build-$(basename "$repo").XXXXXX")"
+  bcycle=0
+  build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
+  while [[ -n "$build_cmd" ]] && [[ "$bcycle" -lt "${MAX_BUILD_CYCLES:-4}" ]]; do
+    bcycle=$((bcycle+1))
+    log "  ⏳ RUN_BUILD (cycle $bcycle) for $(basename "$repo"): $build_cmd"
+    log "     watch: tail -f $blog   (max ${MAX_BUILD_WAIT:-5400}s)"
+    ( cd "$repo" && eval "$build_cmd" ) > "$blog" 2>&1 &
+    bp=$!; waited=0
+    while kill -0 "$bp" 2>/dev/null; do
+      sleep 30; waited=$((waited+30))
+      if [[ $(( waited % 300 )) -eq 0 ]]; then log "    …building $(basename "$repo") (${waited}s elapsed)"; fi
+      if [[ "$waited" -ge "${MAX_BUILD_WAIT:-5400}" ]]; then
+        log "    build exceeded ${MAX_BUILD_WAIT:-5400}s — killing pid $bp and continuing"
+        kill "$bp" 2>/dev/null || true; break
+      fi
+    done
+    build_rc=0; wait "$bp" 2>/dev/null || build_rc=$?
+    log "  build finished (exit $build_rc) for $(basename "$repo") — re-invoking claude"
+    exec_out="$(cd "$repo" && ask_claude "The build the script ran for you finished with exit code $build_rc. Log tail:
+$(tail -40 "$blog" 2>/dev/null)
+
+$reinvoke")" || true
+    build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
+  done
+  rm -f "$blog" 2>/dev/null || true
+  RUN_BUILD_RESULT="$exec_out"
+}
+
 open_pr_for_repo() {
   local repo="$1"
   local existing plan pr_url
@@ -593,8 +635,6 @@ open_pr_for_repo() {
   plan="$(plan_then_review "Bump this repo for the protocol release per the contract" "$repo")"
 
   log "EXECUTE (claude): apply plan, commit, push, open draft PR for $(basename "$repo")"
-  local bdir blog build_cmd build_rc bcycle bp waited
-  bdir="$WORK_DIR/.build-$(basename "$repo")-$$-$RANDOM"; mkdir -p "$bdir"; blog="$bdir/log"
   exec_out="$(cd "$repo" && ask_claude "Apply the plan in full.
 
 The plan may name multiple repos (this one PLUS upstream repos). For
@@ -656,35 +696,10 @@ The FIRST URL must be the PR for $repo (i.e., the working repo).
 PLAN:
 $plan")" || true
 
-  # Long-build handoff: if claude asked the script to run a build (RUN_BUILD:),
-  # the SCRIPT runs it — no LLM-turn time limit, no background-process reaping —
-  # then re-invokes claude with the result to finish. Loops if another build is
-  # requested. Tunable: MAX_BUILD_WAIT (default 5400s), MAX_BUILD_CYCLES (4).
-  bcycle=0
-  build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
-  while [[ -n "$build_cmd" ]] && [[ "$bcycle" -lt "${MAX_BUILD_CYCLES:-4}" ]]; do
-    bcycle=$((bcycle+1))
-    log "  ⏳ RUN_BUILD (cycle $bcycle) for $(basename "$repo"): $build_cmd"
-    log "     watch: tail -f $blog   (max ${MAX_BUILD_WAIT:-5400}s)"
-    ( cd "$repo" && eval "$build_cmd" ) > "$blog" 2>&1 &
-    bp=$!; waited=0
-    while kill -0 "$bp" 2>/dev/null; do
-      sleep 30; waited=$((waited+30))
-      if [[ $(( waited % 300 )) -eq 0 ]]; then log "    …building $(basename "$repo") (${waited}s elapsed)"; fi
-      if [[ "$waited" -ge "${MAX_BUILD_WAIT:-5400}" ]]; then
-        log "    build exceeded ${MAX_BUILD_WAIT:-5400}s — killing pid $bp and continuing"
-        kill "$bp" 2>/dev/null || true; break
-      fi
-    done
-    build_rc=0; wait "$bp" 2>/dev/null || build_rc=$?
-    log "  build finished (exit $build_rc) for $(basename "$repo") — re-invoking claude to commit + open PR"
-    exec_out="$(cd "$repo" && ask_claude "The build the script ran for you finished with exit code $build_rc. Log tail:
-$(tail -40 "$blog" 2>/dev/null)
-
-Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. If the exit code was non-zero, fix the cause first. The cause may be UPSTREAM, not this repo — if the failure traces to an upstream repo (one earlier in the dep chain, whose PR is already open this run), \`cd\` to that upstream repo, push the fix to its EXISTING PR branch (do NOT open a new PR for it), re-pin THIS repo to the upstream's new head, then request another build. OUTPUT FORMAT: print every PR URL on separate lines at the end (including any upstream PR you pushed to), the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop.")" || true
-    build_cmd="$(printf '%s' "$exec_out" | sed -n 's/^RUN_BUILD:[[:space:]]*//p' | head -1)"
-  done
-  rm -rf "$bdir" 2>/dev/null || true
+  # Long-build handoff (see run_build_handoff): the SCRIPT runs any RUN_BUILD:
+  # claude requested, waits, and re-invokes to finish.
+  run_build_handoff "$repo" "$exec_out" "Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. If the exit code was non-zero, fix the cause first. The cause may be UPSTREAM, not this repo — if the failure traces to an upstream repo (one earlier in the dep chain, whose PR is already open this run), \`cd\` to that upstream repo, push the fix to its EXISTING PR branch (do NOT open a new PR for it), re-pin THIS repo to the upstream's new head, then request another build. OUTPUT FORMAT: print every PR URL on separate lines at the end (including any upstream PR you pushed to), the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
+  exec_out="$RUN_BUILD_RESULT"
 
   pr_url="$(printf '%s' "$exec_out" | grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -1)"
 
@@ -956,11 +971,21 @@ $fix_plan" "$repo")"
 target repo. If the target is one of the in-scope checkouts, cd there
 and push to its existing PR branch (do NOT open a new PR for it).
 
-Build + run tests locally ONLY if they finish quickly and synchronously in this
-turn. NEVER launch a long build/test as a background task and end your turn
-waiting for it — in -p mode you are NOT re-invoked, so it strands the run. Do
-NOT attempt a local stellar-core build (30-60 min) — rely on CI. ALWAYS commit
-and push before ending your turn.
+Build + run tests locally to validate BEFORE pushing:
+- Quick builds/tests (cargo/go/pnpm, a few minutes): run them synchronously now.
+- A LONG build (a stellar-core compile, or a TxMeta re-record needing a fresh
+  binary): do NOT run it yourself and do NOT background it — a -p turn is NOT
+  re-invoked, so a backgrounded build strands the run. Make ALL edits first,
+  then emit a single \`RUN_BUILD: <cmd>\` line as your LAST line and STOP (do not
+  push yet). The script runs it, waits however long it takes, and re-invokes you
+  with the result to commit + push.
+- For stellar-core, request an INCREMENTAL build that reuses the already-built
+  in-tree objects + ccache: \`make -j\$(nproc)\` (run \`./configure
+  --enable-next-protocol-version-unsafe-for-production\` only if there's no
+  Makefile yet). NEVER \`make clean\` and never a fresh out-of-tree build dir —
+  that throws away the warm tree and turns a 2-minute rebuild into an hour.
+ALWAYS commit and push before ending your turn — UNLESS you emitted a RUN_BUILD
+line (then stop and wait for the re-invoke).
 
 Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass is
 fine (expected when the CAP changes tx semantics or adds tests). Inspect the
@@ -988,6 +1013,12 @@ $(open_prs_context)
 
 PLAN:
 $fix_plan")"
+
+    # Long-build handoff (e.g. an incremental stellar-core build to validate the
+    # fix before pushing): the SCRIPT runs any RUN_BUILD claude requested, waits,
+    # and re-invokes it to commit + push to the EXISTING PR.
+    run_build_handoff "$repo" "$fix_out" "Now: fix any build fallout, commit ALL changes on the release branch, and push to the EXISTING PR branch (do NOT open a new PR). If the exit code was non-zero, fix the cause first — it may be UPSTREAM (an earlier repo in the dep chain whose PR is open this run): \`cd\` there, push to its existing PR branch, re-pin THIS repo to the upstream's new head, then request another build. OUTPUT: print every PR URL you touched, one per line, at the end. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
+    fix_out="$RUN_BUILD_RESULT"
 
     # Harvest any newly-opened upstream PR URLs.
     while IFS= read -r new_url; do
