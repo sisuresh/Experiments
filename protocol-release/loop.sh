@@ -5,12 +5,18 @@
 # Single invocation processes every in-scope repo:
 #   1. OPEN phase  — for each repo in dep order: plan_then_review →
 #                    claude opens a draft PR. PR URLs recorded in state.
-#   2. WATCH phase — outer loop polls every open PR. On red, plan_then_review
-#                    gets cross-PR context (every open PR + current statuses).
-#                    The planner can route the fix to ANY open PR, including
-#                    an upstream — claude `cd`s to the right repo and pushes.
-#                    Watch continues until all PRs green, all PRs escalate,
-#                    or MAX_WATCH_ITERS hit.
+#   2. WATCH phase — each iteration is two passes:
+#                    POLL pass: ONE gh fetch per PR classifies it
+#                    (GREEN/PENDING/RED + OPEN/MERGED/CLOSED + failing-check
+#                    signature) and rewrites the status table file.
+#                    FIX pass: every actionable red PR gets its own fix job
+#                    (plan_then_review → execute), up to MAX_PARALLEL_FIXES
+#                    concurrently. The planner can route a fix to ANY open
+#                    PR, including an upstream — claude `cd`s there and pushes.
+#                    Ends when all PRs are green/merged, when nothing is
+#                    actionable and nothing is pending (STALLED — operator
+#                    must merge / publish artifacts; exit 3 with a manual-steps
+#                    summary), or when MAX_WATCH_ITERS is hit.
 #
 # Contract + lessons docs (both models read these on every prompt):
 #   Live next to this script. The CONTRACT env var can override the
@@ -64,6 +70,19 @@
 #   MAX_INVESTIGATE_ROUNDS  Cap on INVESTIGATE verdicts before forcing a
 #                     decision (default: 3).
 #   MAX_SAME_FAIL_RETRIES   Same-signature retries before ESCALATE (default: 3).
+#   MAX_PARALLEL_FIXES  Concurrent fix jobs in the watch fix pass (default: 3).
+#                     Each red PR's plan→review→execute runs as its own
+#                     background job. 1 restores the old fully-serial behavior.
+#                     RUN_BUILD builds stay serialized machine-wide regardless
+#                     (one build at a time — memory pressure).
+#   EXIT_ON_STALL     Default 1: exit 3 (with an operator manual-steps summary)
+#                     when a pass finds nothing actionable, nothing pending,
+#                     and no fresh merges — i.e. the run can no longer make
+#                     progress by itself (waiting on human merges / artifact
+#                     publishes). Set 0 to keep polling to MAX_WATCH_ITERS.
+#   DRY_WATCH         Set 1 to run a single poll pass (no fixes, no LLM calls
+#                     in the watch phase), print the status summary, and exit.
+#                     Cheap "where does the release stand right now" command.
 #   IGNORED_CHECKS    Comma-separated check names treated as non-blocking when
 #                     polling PR CI. These are checks that legitimately fail
 #                     on protocol-next PRs and shouldn't drag the watch loop
@@ -108,6 +127,12 @@ MAX_INVESTIGATE_ROUNDS="${MAX_INVESTIGATE_ROUNDS:-3}"
 # occurrence); 3 lets the planner try 3 fixes for the same signature
 # before giving up.
 MAX_SAME_FAIL_RETRIES="${MAX_SAME_FAIL_RETRIES:-3}"
+# Concurrent fix jobs in the watch fix pass. Each red PR's plan→review→execute
+# cycle runs as its own background job (subshell); different repos live in
+# different checkouts so they don't collide on files. 1 = serial (old behavior).
+# RUN_BUILD builds are additionally serialized by a machine-wide lock so
+# parallel jobs can't stack a core build on top of cargo builds and OOM the box.
+MAX_PARALLEL_FIXES="${MAX_PARALLEL_FIXES:-3}"
 # IGNORED_CHECKS is NOT a list of "expected to fail" checks — deciding whether
 # a failure is expected is now the planner's job (see the watch-loop verdict
 # prompt: for EVERY failing check it judges "should this be green at this point
@@ -156,17 +181,68 @@ mkdir -p "$LOG_DIR" "$STATE_DIR" "$WORK_DIR"
 # Fail-state from a previous run would otherwise immediately escalate any
 # still-red PR on the first watch pass of this run (same signature wins).
 rm -f "$WORK_DIR"/.fail-state.*
+# Stale locks / poll table from a previous (killed) run.
+rm -rf "$STATE_DIR"/.lock-* "$WORK_DIR/.poll"
 
 ts="$(date +%Y%m%d-%H%M%S)"
 inputs_id="$(printf '%s' "$(readlink -f "$INPUTS" 2>/dev/null || echo "$INPUTS")" | sha1)"
 runlog="$LOG_DIR/${ts}-${inputs_id}.log"
 state_file="$STATE_DIR/${inputs_id}.json"
+# At-a-glance status table, rewritten every watch poll pass. `cat` (or
+# `watch cat`) this instead of scrolling the runlog.
+STATUS_FILE="$STATE_DIR/${inputs_id}-status.txt"
+# Per-iteration poll results, one file per repo: "MSTATE\tSTATUS\tSIG".
+POLL_DIR="$WORK_DIR/.poll"
+# Cross-PR context cache: rebuilt once per watch iteration from the poll
+# table; empty means "not in the watch phase, fetch live" (Phase 1).
+OPEN_PRS_CACHE=""
 exec > >(tee -a "$runlog") 2>&1
 
 # log writes to stderr so that lines emitted inside $(plan_then_review …)
 # command substitutions still reach the runlog (via the script-level
 # `exec 2>&1` to tee) instead of being captured into the variable.
-log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+log() { printf '[%s] %s%s\n' "$(date '+%H:%M:%S')" "${LOG_PREFIX:-}" "$*" >&2; }
+
+# --- Background-job hygiene ---
+# Parallel fix jobs spawn claude/copilot/build subprocesses. If the operator
+# kills this script, those must die too — an orphaned claude session kept
+# pushing commits after a kill once. kill_tree walks descendants depth-first.
+FIX_PIDS=""
+kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
+  kill "$1" 2>/dev/null || true
+}
+cleanup_jobs() {
+  local p
+  for p in $FIX_PIDS; do
+    if kill -0 "$p" 2>/dev/null; then
+      log "cleanup: killing fix job $p (and its subprocesses)"
+      kill_tree "$p"
+    fi
+  done
+}
+trap cleanup_jobs EXIT
+trap 'exit 130' INT TERM
+
+# --- mkdir spinlocks (macOS has no flock; mkdir is atomic) ---
+# Used for: state-file writes from parallel fix jobs, and the machine-wide
+# one-build-at-a-time RUN_BUILD lock. Stale locks are removed at startup.
+lock_acquire() {  # lock_acquire <name> [timeout-seconds]  → 0 ok, 1 timed out
+  local name="$1" max="${2:-600}" d t=0
+  d="$STATE_DIR/.lock-$name"
+  until mkdir "$d" 2>/dev/null; do
+    [[ "$t" -eq 0 ]] && log "  (waiting for $name lock…)"
+    sleep 2; t=$((t+2))
+    if [[ "$t" -ge "$max" ]]; then
+      log "  WARN: $name lock not acquired after ${max}s — proceeding anyway"
+      return 1
+    fi
+  done
+  return 0
+}
+lock_release() { rmdir "$STATE_DIR/.lock-$1" 2>/dev/null || true; }
+
 log "=== protocol-release-loop ==="
 log "Inputs:    $INPUTS"
 log "Contract:  $CONTRACT"
@@ -176,6 +252,8 @@ log "Reviewer:  copilot / $REVIEWER_MODEL"
 log "State:     $state_file"
 log "Workdir:   $WORK_DIR"
 log "Run log:   $runlog"
+log "Status:    $STATUS_FILE   (rewritten every watch poll pass — 'watch cat' it)"
+log "Parallel:  up to $MAX_PARALLEL_FIXES concurrent fix jobs (MAX_PARALLEL_FIXES)"
 log ""
 log "To watch live LLM output in another terminal:"
 log "  tail -F $LOG_DIR/${ts}-*"
@@ -217,8 +295,14 @@ state_get() {  # state_get <repo-path>
   jq -r --arg k "$1" '.[$k] // empty' "$state_file"
 }
 state_set() {  # state_set <repo-path> <value>
-  local tmp; tmp="$(mktemp)"
+  # Locked: parallel fix jobs write concurrently; an unlocked read-modify-write
+  # (jq from the same base, two mvs) silently drops the loser's key.
+  # Readers need no lock — mv replacement is atomic.
+  local tmp
+  lock_acquire state 120 || true
+  tmp="$(mktemp)"
   jq --arg k "$1" --arg v "$2" '.[$k] = $v' "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+  lock_release state
 }
 
 # --- LLM helpers ---
@@ -249,7 +333,15 @@ ask_copilot_gpt() {
 
 # Format the "open PRs + statuses" context block that every plan-review
 # call receives, so any planner has visibility into the full run.
+# In the watch phase OPEN_PRS_CACHE (rebuilt once per iteration from the
+# poll table) short-circuits this — otherwise EVERY planner/review/execute
+# prompt re-fetches every PR (N gh calls per prompt), which is what used to
+# trip GitHub's secondary rate limit. Phase 1 has no cache → live fetch.
 open_prs_context() {
+  if [[ -n "${OPEN_PRS_CACHE:-}" ]]; then
+    printf '%s' "$OPEN_PRS_CACHE"
+    return
+  fi
   local repo url status
   for repo in "${SCOPE[@]}"; do
     url="$(state_get "$repo")"
@@ -448,7 +540,7 @@ failure_signal() {
               elif (.status // "") != "" and .status != "COMPLETED" then .status
               elif (.state // "") != "" then .state else "UNKNOWN" end),
          u: (.detailsUrl // "")}
-      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE"))]
+      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED","STALE"))]
       | sort_by(.n) | map("  - \(.n) [\(.s)]: \(.u)")[:12] | join("\n")' 2>/dev/null)"
 
   if [[ -n "$failing_jobs" ]]; then
@@ -466,7 +558,7 @@ failure_signal() {
               elif (.status // "") != "" and .status != "COMPLETED" then .status
               elif (.state // "") != "" then .state else "UNKNOWN" end),
          u: (.detailsUrl // "")}
-      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE"))]
+      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED","STALE"))]
       | sort_by(.n) | (.[0].u) // empty' 2>/dev/null)"
   if [[ -n "$fail_job_url" ]]; then
     job_id="$(echo "$fail_job_url" | grep -oE '/job/[0-9]+' | grep -oE '[0-9]+')"
@@ -502,7 +594,7 @@ failure_sig() {
          s: (if (.conclusion // "") != "" then .conclusion
               elif (.status // "") != "" and .status != "COMPLETED" then .status
               elif (.state // "") != "" then .state else "UNKNOWN" end)}
-      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE"))
+      | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED","STALE"))
       | "\(.n)[\(.s)]"] | sort | join(",")' 2>/dev/null || true
 }
 
@@ -525,52 +617,56 @@ _check_state_jq='
       elif (.state // "") != "" then .state
       else "UNKNOWN" end]'
 
-# Returns 0 if every check on the PR is SUCCESS/NEUTRAL/SKIPPED.
-# (Empty rollup → not green, treated as still-loading.)
-pr_is_green() {
-  local pr="$1"
-  gh pr view "$pr" --json statusCheckRollup --jq \
-    --argjson ignored "$IGNORED_CHECKS_JSON" \
-    "$_check_state_jq"' | (length > 0) and all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED")' \
-    2>/dev/null | grep -q '^true$'
-}
-
-# Returns 0 if ANY check is still running / queued / awaiting.
-pr_is_pending() {
-  local pr="$1"
-  gh pr view "$pr" --json statusCheckRollup --jq \
-    --argjson ignored "$IGNORED_CHECKS_JSON" \
-    "$_check_state_jq"' | any(. == "PENDING" or . == "QUEUED" or . == "IN_PROGRESS" or . == "EXPECTED" or . == "UNKNOWN")' \
-    2>/dev/null | grep -q '^true$'
-}
-
-# Classify a PR's CI from a SINGLE rollup fetch (retried on a failed/empty
-# fetch — transient gh error or secondary rate limit). Echoes exactly one of:
-#   GREEN   — all (non-ignored) checks SUCCESS/NEUTRAL/SKIPPED
-#   PENDING — at least one check still running/queued (or no checks yet)
-#   RED     — a real failure, nothing pending
-#   UNKNOWN — couldn't read CI after retries (caller treats as pending, NEVER red)
-# This supersedes calling pr_is_green + pr_is_pending separately: those did two
-# independent gh calls, so the watch-start gh burst could break one but not the
-# other and a green PR got misclassified RED. One fetch removes that race.
-pr_status() {
-  local pr="$1" rollup states t
-  rollup=""
+# Poll one PR with a SINGLE gh fetch (retried on transient failure / secondary
+# rate limit) and emit everything the watch loop needs, tab-separated:
+#   MSTATE  — OPEN / MERGED / CLOSED / UNKNOWN (merge state)
+#   STATUS  — GREEN   all (non-ignored) checks SUCCESS/NEUTRAL/SKIPPED
+#             PENDING at least one check running/queued (or none reported yet)
+#             RED     a real failure, nothing pending
+#             UNKNOWN couldn't read CI after retries (treat as pending, NEVER red)
+#   SIG     — stable failing-check signature (sorted "name[state]", no URLs;
+#             empty unless RED). Same key the SKIP cache uses.
+# One fetch (not separate green/pending/state calls) so a gh burst can't break
+# one check but not another and misread a green PR as RED — and the whole
+# iteration costs N calls instead of ~4N.
+poll_pr() {
+  local pr="$1" payload="" t mstate states status sig
   for t in 1 2 3; do
-    rollup="$(gh pr view "$pr" --json statusCheckRollup 2>/dev/null)"
-    [[ -n "$rollup" ]] && break
+    payload="$(gh pr view "$pr" --json state,statusCheckRollup 2>/dev/null)"
+    [[ -n "$payload" ]] && break
     sleep 5
   done
-  [[ -z "$rollup" ]] && { echo UNKNOWN; return; }
-  states="$(printf '%s' "$rollup" | jq -r --argjson ignored "$IGNORED_CHECKS_JSON" "$_check_state_jq | .[]?" 2>/dev/null)"
-  [[ -z "$states" ]] && { echo PENDING; return; }
-  if printf '%s\n' "$states" | grep -qE '^(PENDING|QUEUED|IN_PROGRESS|EXPECTED|UNKNOWN)$'; then
-    echo PENDING; return
+  if [[ -z "$payload" ]]; then printf 'UNKNOWN\tUNKNOWN\t\n'; return; fi
+  mstate="$(printf '%s' "$payload" | jq -r '.state // "UNKNOWN"' 2>/dev/null)"
+  [[ -z "$mstate" ]] && mstate="UNKNOWN"
+  states="$(printf '%s' "$payload" | jq -r --argjson ignored "$IGNORED_CHECKS_JSON" "$_check_state_jq | .[]?" 2>/dev/null)"
+  if [[ -z "$states" ]]; then
+    status="PENDING"
+  elif printf '%s\n' "$states" | grep -qE '^(PENDING|QUEUED|IN_PROGRESS|EXPECTED|UNKNOWN)$'; then
+    status="PENDING"
+  elif printf '%s\n' "$states" | grep -qvE '^(SUCCESS|NEUTRAL|SKIPPED)$'; then
+    status="RED"
+  else
+    status="GREEN"
   fi
-  if printf '%s\n' "$states" | grep -qvE '^(SUCCESS|NEUTRAL|SKIPPED)$'; then
-    echo RED; return
+  sig=""
+  if [[ "$status" == "RED" ]]; then
+    sig="$(printf '%s' "$payload" | jq -r --argjson ignored "$IGNORED_CHECKS_JSON" \
+      '[.statusCheckRollup[]?
+        | select(((.name // .context // "") | tostring) as $n | ($ignored // []) | index($n) | not)
+        | {n: (.name // .context // "?"),
+           s: (if (.conclusion // "") != "" then .conclusion
+                elif (.status // "") != "" and .status != "COMPLETED" then .status
+                elif (.state // "") != "" then .state else "UNKNOWN" end)}
+        | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED","STALE"))
+        | "\(.n)[\(.s)]"] | sort | join(",")' 2>/dev/null)"
   fi
-  echo GREEN
+  printf '%s\t%s\t%s\n' "$mstate" "$status" "$sig"
+}
+
+# Per-repo poll-result file for the current iteration.
+poll_file() {
+  printf '%s/%s' "$POLL_DIR" "$(printf '%s' "$1" | tr '/' '_')"
 }
 
 # Open a draft PR for a repo: plan_then_review + claude executes. Records
@@ -595,6 +691,10 @@ run_build_handoff() {
   while [[ -n "$build_cmd" ]] && [[ "$bcycle" -lt "${MAX_BUILD_CYCLES:-4}" ]]; do
     bcycle=$((bcycle+1))
     log "  ⏳ RUN_BUILD (cycle $bcycle) for $(basename "$repo"): $build_cmd"
+    # ONE build at a time machine-wide: parallel fix jobs could otherwise
+    # stack a stellar-core compile on top of cargo builds and OOM the box
+    # (that hang happened once with an unbounded make -j).
+    lock_acquire build $(( ${MAX_BUILD_WAIT:-5400} + 1800 )) || true
     log "     watch: tail -f $blog   (max ${MAX_BUILD_WAIT:-5400}s)"
     ( cd "$repo" && eval "$build_cmd" ) > "$blog" 2>&1 &
     bp=$!; waited=0
@@ -607,6 +707,7 @@ run_build_handoff() {
       fi
     done
     build_rc=0; wait "$bp" 2>/dev/null || build_rc=$?
+    lock_release build
     log "  build finished (exit $build_rc) for $(basename "$repo") — re-invoking claude"
     exec_out="$(cd "$repo" && ask_claude "The build the script ran for you finished with exit code $build_rc. Log tail:
 $(tail -40 "$blog" 2>/dev/null)
@@ -733,9 +834,15 @@ $plan")" || true
 # =============================================================
 log ""
 log "=== Phase 1: OPEN ==="
-for repo in "${TARGETS[@]}"; do
-  open_pr_for_repo "$repo"
-done
+if [[ "${DRY_WATCH:-0}" == "1" ]]; then
+  # A status snapshot must not open PRs or invoke planners — repos without
+  # an open PR are simply reported as NOT-OPENED in the table below.
+  log "DRY_WATCH: skipping Phase 1 (nothing is opened in a dry run)"
+else
+  for repo in "${TARGETS[@]}"; do
+    open_pr_for_repo "$repo"
+  done
+fi
 
 # =============================================================
 # Phase 2: WATCH — poll all open PRs; route fixes via planner
@@ -767,130 +874,173 @@ clear_skip_sig() { rm -f "$(fail_state_file "$1").skipsig"; }
 get_pr_prev_state() { local f; f="$(fail_state_file "$1").prstate"; [[ -f "$f" ]] && cat "$f" || true; }
 set_pr_prev_state() { printf '%s' "$2" > "$(fail_state_file "$1").prstate"; }
 
-# Read the live PR state (OPEN / MERGED / CLOSED) for a URL.
-pr_state() {
-  gh pr view "$1" --json state --jq .state 2>/dev/null || true
+# The one-line reason the planner gave for a SKIP verdict; surfaced in the
+# status table and the final operator summary ("waiting on: …").
+set_skip_reason() { printf '%s' "$2" > "$(fail_state_file "$1").skipreason"; }
+get_skip_reason() { local f; f="$(fail_state_file "$1").skipreason"; [[ -f "$f" ]] && cat "$f" || true; }
+
+# Escalation = "frozen for THIS run, operator should look" — a side flag, NOT
+# a state-file value. Writing the literal string ESCALATED into state used to
+# OVERWRITE the PR URL, so the next run forgot the PR existed and re-planned
+# it from scratch (fresh-base would even clobber the branch). The flag lives
+# under .fail-state.* so the startup wipe clears it: a re-run re-judges the
+# repo with fresh counters instead of re-opening its PR. (state=ESCALATED is
+# still written by Phase 1 when opening FAILED — there's no URL to preserve.)
+set_escalated() { : > "$(fail_state_file "$1").escalated"; }
+is_escalated()  { [[ -f "$(fail_state_file "$1").escalated" ]]; }
+any_escalated() {
+  jq -e 'to_entries[] | select(.value == "ESCALATED")' "$state_file" >/dev/null 2>&1 && return 0
+  ls "$WORK_DIR"/.fail-state.*.escalated >/dev/null 2>&1
 }
 
-# Inside the watch phase we want resilience over strictness: a transient
-# `gh` failure, an unexpected jq output, a grep with no match, etc. must
-# NOT exit the script — the only exit condition is "all PRs green" or
-# MAX_WATCH_ITERS. Relax errexit/pipefail for the duration of the loop;
-# the loop body manages its own control flow with explicit `continue`s.
-set +e
-set +o pipefail
+# SCOPE = Targets ∪ state-file keys, targets first (dep order), state-only
+# entries appended in insertion order. Rebuilt at the top of every watch
+# iteration: parallel fix jobs run in subshells, so a `SCOPE+=` there would be
+# lost — they record new upstream PRs in the STATE FILE instead, and this
+# picks them up.
+rebuild_scope() {
+  SCOPE=("${TARGETS[@]}")
+  local k
+  while IFS= read -r k; do
+    [[ -z "$k" ]] && continue
+    in_scope "$k" || SCOPE+=("$k")
+  done < <(jq -r 'keys_unsorted[]' "$state_file" 2>/dev/null)
+}
 
-for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
-  log ""
-  log "--- watch iter $iter/$MAX_WATCH_ITERS ---"
-
-  # Pre-pass: detect OPEN→MERGED transitions among in-scope PRs. Any merge
-  # invalidates SKIP caches for the *other* repos (their planners will now
-  # see the merge in open_prs_context and can propose a repin to the merge
-  # commit). Also stamp the new state so a transition only fires once.
-  merged_this_iter=()
-  for repo in "${SCOPE[@]}"; do
-    pr="$(state_get "$repo")"
-    [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
-    cur_state="$(pr_state "$pr")"
-    [[ -z "$cur_state" ]] && continue
-    prev_state="$(get_pr_prev_state "$repo")"
-    if [[ "$cur_state" == "MERGED" && "$prev_state" != "MERGED" ]]; then
-      log "🎉 $(basename "$repo") upstream merged: $pr"
-      merged_this_iter+=("$repo")
-    fi
-    set_pr_prev_state "$repo" "$cur_state"
-  done
-  if [[ ${#merged_this_iter[@]} -gt 0 ]]; then
+# Rewrite the at-a-glance status table ($STATUS_FILE) from the current poll
+# table. $1 = one-line activity note (what the loop is doing right now).
+write_status_file() {
+  local note="${1:-}" tmp repo url f mstate status sig disp extra sk
+  tmp="$(mktemp)"
+  {
+    printf '%s — iter %s/%s @ %s\n' "$(basename "$INPUTS")" "${iter:-0}" "$MAX_WATCH_ITERS" "$(date '+%F %T')"
+    [[ -n "$note" ]] && printf '>> %s\n' "$note"
+    printf '\n'
     for repo in "${SCOPE[@]}"; do
-      # Clear skip cache for OTHER repos so they re-evaluate against the
-      # newly-merged upstream and the planner can propose a repin.
-      skip_owner=false
-      for m in "${merged_this_iter[@]}"; do
-        [[ "$m" == "$repo" ]] && skip_owner=true
-      done
-      [[ "$skip_owner" == true ]] && continue
-      if [[ -n "$(get_skip_sig "$repo")" ]]; then
-        log "  clearing SKIP cache for $(basename "$repo") — upstream merge may unblock"
-        clear_skip_sig "$repo"
-        set_same_fail_count "$repo" 0
-      fi
-    done
-  fi
-
-  all_done=true
-  any_actionable=false
-
-  for repo in "${SCOPE[@]}"; do
-    pr="$(state_get "$repo")"
-    [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
-    REPO_EFFORT="$(effort_for_repo "$repo")"
-
-    # Classify CI from a SINGLE rollup fetch (retried on transient failure).
-    # One fetch (not separate pr_is_green/pr_is_pending calls) so the
-    # watch-start gh burst can't break one check but not the other and
-    # misread a green PR as RED. Unreadable CI is treated as pending, never RED.
-    case "$(pr_status "$pr")" in
-      GREEN)
-        log "$(basename "$repo"): GREEN $pr"
-        continue ;;
-      PENDING)
-        log "$(basename "$repo"): pending $pr"
-        all_done=false
-        continue ;;
-      UNKNOWN)
-        log "$(basename "$repo"): CI unreadable (transient gh error / rate limit) — retry next pass $pr"
-        all_done=false
-        continue ;;
-    esac
-
-    # Red.
-    all_done=false
-    log "$(basename "$repo"): RED $pr"
-
-    fail_log="$(failure_signal "$pr")"
-    [[ -z "$fail_log" ]] && fail_log="(no failure signal extracted — inspect $pr manually)"
-    # Stable cache key: the SET of failing checks, not the log text (whose URLs
-    # carry run/job IDs that change every re-run). Fall back to the log head if
-    # no terminal-failure check parsed (e.g. a state we don't enumerate).
-    fail_sig="$(failure_sig "$pr")"
-    [[ -z "$fail_sig" ]] && fail_sig="$(printf '%s' "$fail_log" | head -3)"
-
-    # Sticky-SKIP short-circuit: if this PR was previously verdicted SKIP
-    # and the failure signature hasn't changed, don't burn another
-    # plan-review cycle. The PR is in a known-non-blocking state.
-    skip_sig="$(get_skip_sig "$repo")"
-    if [[ -n "$skip_sig" && "$skip_sig" == "$fail_sig" ]]; then
-      log "  $(basename "$repo"): SKIP (cached — same fail-sig as previous SKIP verdict)"
-      continue
-    fi
-
-    any_actionable=true
-    log "  signal:"
-    printf '    %s\n' "$fail_log" | head -10
-
-    # Same-failure-N detection per-PR. ESCALATE only after the same
-    # signature has persisted MAX_SAME_FAIL_RETRIES retries in a row
-    # (default 3 — gives the planner a few attempts to diagnose hard
-    # CI failures). (Skipped when the SKIP cache would have matched.)
-    prev_sig="$(get_prev_fail_sig "$repo")"
-    if [[ "$prev_sig" == "$fail_sig" && -n "$fail_sig" ]]; then
-      new_count=$(($(get_same_fail_count "$repo") + 1))
-      set_same_fail_count "$repo" "$new_count"
-      log "  same failure as previous iter ($(basename "$repo")), retry $new_count/$MAX_SAME_FAIL_RETRIES"
-      if [[ "$new_count" -ge "$MAX_SAME_FAIL_RETRIES" ]]; then
-        log "  ESCALATE: same failure on $(basename "$repo") for $((new_count + 1)) consecutive iters"
-        state_set "$repo" "ESCALATED"
+      url="$(state_get "$repo")"
+      if [[ -z "$url" ]]; then
+        printf '%-13s %-26s\n' "NOT-OPENED" "$(basename "$repo")"
         continue
       fi
-    else
-      set_same_fail_count "$repo" 0
-    fi
-    set_prev_fail_sig "$repo" "$fail_sig"
+      if [[ "$url" == "ESCALATED" ]]; then
+        printf '%-13s %-26s %s\n' "ESCALATED" "$(basename "$repo")" "operator must inspect (see runlog)"
+        continue
+      fi
+      f="$(poll_file "$repo")"
+      mstate=""; status="?"; sig=""
+      [[ -f "$f" ]] && IFS=$'\t' read -r mstate status sig < "$f"
+      disp="$status"; extra=""
+      if is_escalated "$repo"; then
+        disp="ESCALATED"; extra="frozen this run — operator must inspect"
+      elif [[ "$mstate" == "MERGED" ]]; then
+        disp="MERGED"
+      elif [[ "$status" == "RED" ]]; then
+        sk="$(get_skip_sig "$repo")"
+        if [[ -n "$sk" && "$sk" == "$sig" ]]; then
+          disp="EXPECTED-RED"
+          extra="waiting: $(get_skip_reason "$repo" | cut -c1-160)"
+        else
+          extra="failing: $sig"
+        fi
+      fi
+      printf '%-13s %-26s %s%s\n' "$disp" "$(basename "$repo")" "$url" "${extra:+   $extra}"
+    done
+  } > "$tmp" && mv "$tmp" "$STATUS_FILE"
+}
 
-    # Plan a fix. INVESTIGATE-aware: the planner can take extra reading
-    # turns before committing to FIX/SKIP. Cap at MAX_INVESTIGATE_ROUNDS.
-    fix_task="CI is red on $pr ($(basename "$repo")).
+# Final per-repo report + explicit operator TODO. Used by every exit path
+# (ALL DONE, STALLED, iters exhausted, DRY_WATCH) so the run always ends by
+# saying what a human must do next — never just a state dump.
+final_summary() {
+  local headline="$1"
+  local repo url f mstate status sig reason has_core_open=false
+  log ""
+  log "=== $headline ==="
+  for repo in "${SCOPE[@]}"; do
+    url="$(state_get "$repo")"
+    if [[ -z "$url" ]]; then
+      log "  ⚪ $(basename "$repo"): NOT-OPENED"
+      continue
+    fi
+    if [[ "$url" == "ESCALATED" ]]; then
+      log "  🛑 $(basename "$repo"): ESCALATED — operator must inspect (see runlog)"
+      continue
+    fi
+    f="$(poll_file "$repo")"
+    mstate=""; status="?"; sig=""
+    [[ -f "$f" ]] && IFS=$'\t' read -r mstate status sig < "$f"
+    case "$(basename "$repo")" in
+      stellar-core|*--stellar-core) [[ "$mstate" != "MERGED" ]] && has_core_open=true ;;
+    esac
+    if is_escalated "$repo"; then
+      log "  🛑 $(basename "$repo"): ESCALATED — frozen this run, operator must inspect  $url"
+      continue
+    fi
+    if [[ "$mstate" == "MERGED" ]]; then
+      log "  ✅ $(basename "$repo"): MERGED  $url"
+    elif [[ "$status" == "GREEN" ]]; then
+      log "  🟢 $(basename "$repo"): GREEN — ready to merge  $url"
+    elif [[ "$status" == "RED" ]]; then
+      if [[ -n "$(get_skip_sig "$repo")" ]]; then
+        reason="$(get_skip_reason "$repo" | cut -c1-200)"
+        log "  🟡 $(basename "$repo"): EXPECTED-RED ($sig)  $url"
+        [[ -n "$reason" ]] && log "       waiting on: $reason"
+      else
+        log "  🔴 $(basename "$repo"): RED — unresolved ($sig)  $url"
+      fi
+    elif [[ "$status" == "PENDING" ]]; then
+      log "  ⏳ $(basename "$repo"): CI still running  $url"
+    else
+      log "  ❓ $(basename "$repo"): $status  $url"
+    fi
+  done
+  log ""
+  log "Manual steps for the operator:"
+  log "  1. Merge the GREEN PRs in dependency order (the Targets order in $INPUTS)."
+  log "  2. EXPECTED-RED PRs clear as upstreams merge / artifacts publish — after"
+  log "     merging, re-run to repin downstreams and re-verify:  ./loop.sh $INPUTS"
+  if [[ "$has_core_open" == true ]]; then
+    log "  3. stellar-core: after its PR merges, trigger the Jenkins vnext deb+docker"
+    log "     build — downstream artifact-waits stay red until the matching-commit"
+    log "     artifact publishes (see lessons.md)."
+  fi
+  log "  Status table: $STATUS_FILE"
+}
+
+# Count still-running parallel fix jobs (bash 3.2: no wait -n / jobs -p games).
+live_fix_jobs() {
+  local n=0 p
+  for p in $FIX_PIDS; do
+    kill -0 "$p" 2>/dev/null && n=$((n+1))
+  done
+  echo "$n"
+}
+
+# One red PR's full fix cycle: failure signal → plan_then_review (INVESTIGATE-
+# aware) → verdict → execute → RUN_BUILD handoff → harvest new upstream PRs.
+# Runs as a BACKGROUND JOB in the fix pass, so:
+#   - LOG_PREFIX/REPO_EFFORT are locals — bash dynamic scoping makes them
+#     visible to log()/ask_claude() below this frame without leaking to
+#     other jobs.
+#   - All cross-job effects go through files: state_set is lock-protected,
+#     fail-state bookkeeping files are per-repo. SCOPE is NOT mutated here —
+#     harvested upstream PRs land in the state file and enter SCOPE at the
+#     next iteration's rebuild_scope.
+fix_one_repo() {
+  local repo="$1" pr="$2" fail_sig="$3"
+  local LOG_PREFIX="[$(basename "$repo")] "
+  local REPO_EFFORT; REPO_EFFORT="$(effort_for_repo "$repo")"
+  local fail_log fix_task fix_plan investigate_n inv_line first_line fix_out
+  local new_url new_path
+
+  fail_log="$(failure_signal "$pr")"
+  [[ -z "$fail_log" ]] && fail_log="(no failure signal extracted — inspect $pr manually)"
+  log "signal:"
+  printf '    %s\n' "$fail_log" | head -10
+
+  # Plan a fix. INVESTIGATE-aware: the planner can take extra reading
+  # turns before committing to FIX/SKIP. Cap at MAX_INVESTIGATE_ROUNDS.
+  fix_task="CI is red on $pr ($(basename "$repo")).
 
 $fail_log
 
@@ -928,48 +1078,53 @@ must be one of:
                    re-invokes you with these findings.
 The script greps line 1 for the verdict — put it there."
 
-    fix_plan="$(plan_then_review "$fix_task" "$repo")"
+  fix_plan="$(plan_then_review "$fix_task" "$repo")"
 
-    # INVESTIGATE loop: re-invoke with accumulated findings up to a cap.
-    investigate_n=0
-    while [[ "$investigate_n" -lt "$MAX_INVESTIGATE_ROUNDS" ]]; do
-      inv_line="$(printf '%s' "$fix_plan" | awk 'NF{print; exit}')"
-      if ! printf '%s' "$inv_line" | grep -qiE '^\**INVESTIGATE\b'; then
-        break
-      fi
-      investigate_n=$((investigate_n + 1))
-      log "  planner: INVESTIGATE (round $investigate_n/$MAX_INVESTIGATE_ROUNDS) — re-invoking"
-      fix_plan="$(plan_then_review "$fix_task
+  # INVESTIGATE loop: re-invoke with accumulated findings up to a cap.
+  investigate_n=0
+  while [[ "$investigate_n" -lt "$MAX_INVESTIGATE_ROUNDS" ]]; do
+    inv_line="$(printf '%s' "$fix_plan" | awk 'NF{print; exit}')"
+    if ! printf '%s' "$inv_line" | grep -qiE '^\**INVESTIGATE\b'; then
+      break
+    fi
+    investigate_n=$((investigate_n + 1))
+    log "planner: INVESTIGATE (round $investigate_n/$MAX_INVESTIGATE_ROUNDS) — re-invoking"
+    fix_plan="$(plan_then_review "$fix_task
 
 PRIOR INVESTIGATION (from previous pass — extend your reading and
 either commit to SKIP/FIX or INVESTIGATE again with new findings):
 $fix_plan" "$repo")"
-    done
+  done
 
-    # Final verdict detection: SKIP / FIX (default).
-    first_line="$(printf '%s' "$fix_plan" | awk 'NF{print; exit}')"
-    if printf '%s' "$first_line" | grep -qiE '^\**SKIP\b' \
-       || printf '%s' "$fix_plan" | grep -qiE '^[[:space:]]*##.*Verdict.*\bSKIP\b'; then
-      log "  planner: SKIP this round (verdict: $(printf '%s' "$first_line" | head -c 100))"
-      # Cache the SKIP'd signature so future iterations short-circuit until
-      # the signature changes (new commit, new failure).
-      set_skip_sig "$repo" "$fail_sig"
-      # Also reset same-failure tracking so the next non-SKIP failure
-      # (if any) gets a fresh count.
-      set_same_fail_count "$repo" 0
-      continue
-    fi
-    if printf '%s' "$first_line" | grep -qiE '^\**INVESTIGATE\b'; then
-      log "  planner: still INVESTIGATE after $MAX_INVESTIGATE_ROUNDS rounds — treating as no-action this iter; will retry next iter"
-      continue
-    fi
-    # Not a SKIP / INVESTIGATE — going to fix something. Clear stale SKIP cache.
-    clear_skip_sig "$repo"
+  # Final verdict detection: SKIP / FIX (default).
+  first_line="$(printf '%s' "$fix_plan" | awk 'NF{print; exit}')"
+  if printf '%s' "$first_line" | grep -qiE '^\**SKIP\b' \
+     || printf '%s' "$fix_plan" | grep -qiE '^[[:space:]]*##.*Verdict.*\bSKIP\b'; then
+    log "planner: SKIP this round (verdict: $(printf '%s' "$first_line" | head -c 100))"
+    # Cache the SKIP'd signature so future iterations short-circuit until
+    # the signature changes (new commit, new failure). Keep a one-line
+    # reason for the status table / operator summary.
+    set_skip_sig "$repo" "$fail_sig"
+    set_skip_reason "$repo" "$(printf '%s\n' "$fix_plan" | awk 'NF' | sed -n '1,3p' | tr '\n' ' ' | cut -c1-300)"
+    set_same_fail_count "$repo" 0
+    return 0
+  fi
+  if printf '%s' "$first_line" | grep -qiE '^\**INVESTIGATE\b'; then
+    log "planner: still INVESTIGATE after $MAX_INVESTIGATE_ROUNDS rounds — treating as no-action this iter; will retry next iter"
+    return 0
+  fi
+  # Not a SKIP / INVESTIGATE — going to fix something. Clear stale SKIP cache.
+  clear_skip_sig "$repo"
 
-    log "  EXECUTE (claude): apply fix"
-    fix_out="$(cd "$repo" && ask_claude "Apply this fix. The plan names a
+  log "EXECUTE (claude): apply fix"
+  fix_out="$(cd "$repo" && ask_claude "Apply this fix. The plan names a
 target repo. If the target is one of the in-scope checkouts, cd there
 and push to its existing PR branch (do NOT open a new PR for it).
+
+NOTE: other fix agents may be running CONCURRENTLY on OTHER repos' PRs.
+Touch only the repo(s) your plan names. If a git operation fails because
+another process holds the lock (index.lock / cannot lock ref), wait ~10s
+and retry.
 
 Build + run tests locally to validate BEFORE pushing:
 - Quick builds/tests (cargo/go/pnpm, a few minutes): run them synchronously now.
@@ -1014,53 +1169,231 @@ $(open_prs_context)
 PLAN:
 $fix_plan")"
 
-    # Long-build handoff (e.g. an incremental stellar-core build to validate the
-    # fix before pushing): the SCRIPT runs any RUN_BUILD claude requested, waits,
-    # and re-invokes it to commit + push to the EXISTING PR.
-    run_build_handoff "$repo" "$fix_out" "Now: fix any build fallout, commit ALL changes on the release branch, and push to the EXISTING PR branch (do NOT open a new PR). If the exit code was non-zero, fix the cause first — it may be UPSTREAM (an earlier repo in the dep chain whose PR is open this run): \`cd\` there, push to its existing PR branch, re-pin THIS repo to the upstream's new head, then request another build. OUTPUT: print every PR URL you touched, one per line, at the end. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
-    fix_out="$RUN_BUILD_RESULT"
+  # Long-build handoff (e.g. an incremental stellar-core build to validate the
+  # fix before pushing): the SCRIPT runs any RUN_BUILD claude requested, waits,
+  # and re-invokes it to commit + push to the EXISTING PR.
+  run_build_handoff "$repo" "$fix_out" "Now: fix any build fallout, commit ALL changes on the release branch, and push to the EXISTING PR branch (do NOT open a new PR). If the exit code was non-zero, fix the cause first — it may be UPSTREAM (an earlier repo in the dep chain whose PR is open this run): \`cd\` there, push to its existing PR branch, re-pin THIS repo to the upstream's new head, then request another build. OUTPUT: print every PR URL you touched, one per line, at the end. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
+  fix_out="$RUN_BUILD_RESULT"
 
-    # Harvest any newly-opened upstream PR URLs.
-    while IFS= read -r new_url; do
-      [[ -z "$new_url" ]] && continue
-      # Skip URLs we already track.
-      if jq -e --arg v "$new_url" 'to_entries[] | select(.value == $v)' "$state_file" >/dev/null; then
-        continue
+  # Harvest any newly-opened upstream PR URLs into the state file. SCOPE
+  # picks them up at the next iteration's rebuild_scope.
+  while IFS= read -r new_url; do
+    [[ -z "$new_url" ]] && continue
+    if jq -e --arg v "$new_url" 'to_entries[] | select(.value == $v)' "$state_file" >/dev/null; then
+      continue
+    fi
+    new_path="$(find_or_propose_repo_for_pr "$new_url")"
+    if [[ -d "$new_path/.git" ]]; then
+      log "scope+: $new_url → $new_path (existing checkout; watched from next iter)"
+    else
+      log "scope+: $new_url → $new_path (claude is expected to have cloned here; watched from next iter)"
+    fi
+    state_set "$new_path" "$new_url"
+  done < <(extract_pr_urls "$fix_out")
+}
+
+# Inside the watch phase we want resilience over strictness: a transient
+# `gh` failure, an unexpected jq output, a grep with no match, etc. must
+# NOT exit the script — the only exit condition is "all PRs green" or
+# MAX_WATCH_ITERS. Relax errexit/pipefail for the duration of the loop;
+# the loop body manages its own control flow with explicit `continue`s.
+set +e
+set +o pipefail
+
+for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
+  log ""
+  log "--- watch iter $iter/$MAX_WATCH_ITERS ---"
+
+  # SCOPE = Targets ∪ state-file keys (fix jobs record new upstream PRs in
+  # the state file from their subshells; this is where they join the watch).
+  rebuild_scope
+
+  rm -rf "$POLL_DIR"; mkdir -p "$POLL_DIR"
+  merged_this_iter=()
+  all_done=true
+  saw_pending=false
+
+  # ---- POLL PASS: one gh fetch per PR → merge state, CI status, fail sig.
+  # The full status table is visible within ~a minute, BEFORE any fix work
+  # starts (fixes used to be interleaved here, so one slow fix hid the rest
+  # of the table for hours). Results land in $POLL_DIR and drive everything
+  # below; OPEN→MERGED transition detection rides the same single fetch.
+  for repo in "${SCOPE[@]}"; do
+    pr="$(state_get "$repo")"
+    [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
+    line="$(poll_pr "$pr")"
+    printf '%s\n' "$line" > "$(poll_file "$repo")"
+    IFS=$'\t' read -r mstate status sig <<< "$line"
+
+    if [[ "$mstate" == "MERGED" ]]; then
+      if [[ "$(get_pr_prev_state "$repo")" != "MERGED" ]]; then
+        log "🎉 $(basename "$repo") merged: $pr"
+        merged_this_iter+=("$repo")
       fi
-      # Locate (or designate a workdir path for) this PR's repo.
-      new_path="$(find_or_propose_repo_for_pr "$new_url")"
-      if [[ -d "$new_path/.git" ]]; then
-        log "  scope+: $new_url → $new_path (existing checkout)"
-      else
-        log "  scope+: $new_url → $new_path (claude is expected to have cloned here)"
-      fi
-      state_set "$new_path" "$new_url"
-      in_scope "$new_path" || SCOPE+=("$new_path")
-    done < <(extract_pr_urls "$fix_out")
+      set_pr_prev_state "$repo" "MERGED"
+      log "$(basename "$repo"): MERGED ✔ $pr"
+      continue
+    fi
+    # Escalated this run: report-only (still polled for the table + merge
+    # detection above, but no fix work and no effect on done/stall flags).
+    if is_escalated "$repo"; then
+      log "$(basename "$repo"): ESCALATED (frozen this run — operator) $pr"
+      continue
+    fi
+    if [[ "$mstate" == "CLOSED" ]]; then
+      log "WARNING: $(basename "$repo") PR was CLOSED without merging — escalating (operator intervened?): $pr"
+      set_escalated "$repo"
+      continue
+    fi
+    [[ "$mstate" != "UNKNOWN" && -n "$mstate" ]] && set_pr_prev_state "$repo" "$mstate"
+
+    case "$status" in
+      GREEN)   log "$(basename "$repo"): GREEN $pr" ;;
+      PENDING) log "$(basename "$repo"): pending $pr"; all_done=false; saw_pending=true ;;
+      UNKNOWN) log "$(basename "$repo"): CI unreadable (transient gh error / rate limit) — retry next pass $pr"; all_done=false; saw_pending=true ;;
+      RED)     log "$(basename "$repo"): RED $pr"; all_done=false ;;
+    esac
+    sleep 1   # pace the poll burst — the secondary rate limit bites on bursts
   done
 
-  # Done conditions.
+  # Any merge invalidates the OTHER repos' SKIP caches: their planners can
+  # now see the merge in the cross-PR context and propose a repin.
+  if [[ ${#merged_this_iter[@]} -gt 0 ]]; then
+    for repo in "${SCOPE[@]}"; do
+      skip_owner=false
+      for m in "${merged_this_iter[@]}"; do
+        [[ "$m" == "$repo" ]] && skip_owner=true
+      done
+      [[ "$skip_owner" == true ]] && continue
+      if [[ -n "$(get_skip_sig "$repo")" ]]; then
+        log "  clearing SKIP cache for $(basename "$repo") — upstream merge may unblock"
+        clear_skip_sig "$repo"
+        set_same_fail_count "$repo" 0
+      fi
+    done
+  fi
+
+  # Cross-PR context for every prompt this iteration — built ONCE from the
+  # poll table instead of N gh calls inside every planner/review/execute
+  # prompt (that per-prompt fan-out is what used to trip the secondary rate
+  # limit). Includes each PR's failing checks so a planner fixing repo X
+  # sees exactly what's red elsewhere. Refreshed next iteration.
+  OPEN_PRS_CACHE=""
+  for repo in "${SCOPE[@]}"; do
+    url="$(state_get "$repo")"
+    if [[ -z "$url" || "$url" == "ESCALATED" ]]; then
+      OPEN_PRS_CACHE="${OPEN_PRS_CACHE}- $repo: ${url:-NOT-YET-OPENED}"$'\n'
+      continue
+    fi
+    pf="$(poll_file "$repo")"
+    if [[ -f "$pf" ]]; then
+      IFS=$'\t' read -r mstate status sig < "$pf"
+      OPEN_PRS_CACHE="${OPEN_PRS_CACHE}- $repo: $url [$mstate, CI=$status${sig:+, failing: $sig}]"$'\n'
+    else
+      OPEN_PRS_CACHE="${OPEN_PRS_CACHE}- $repo: $url [not polled]"$'\n'
+    fi
+  done
+
+  write_status_file "poll pass done — dispatching fixes next"
+
+  if [[ "${DRY_WATCH:-0}" == "1" ]]; then
+    final_summary "DRY_WATCH snapshot (single poll pass; no fixes attempted)"
+    exit 0
+  fi
+
+  # ---- FIX PASS: dispatch every actionable red as its own background job,
+  # up to MAX_PARALLEL_FIXES concurrent. Bookkeeping (skip cache, same-
+  # failure escalation) stays HERE in the main shell — cheap file ops, no
+  # races — so a job is only spawned when there's real planner work to do.
+  any_actionable=false
+  FIX_PIDS=""
+  fix_names=""
+
+  for repo in "${SCOPE[@]}"; do
+    pr="$(state_get "$repo")"
+    [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
+    is_escalated "$repo" && continue
+    pf="$(poll_file "$repo")"
+    [[ -f "$pf" ]] || continue
+    IFS=$'\t' read -r mstate status sig < "$pf"
+    [[ "$status" == "RED" && "$mstate" == "OPEN" ]] || continue
+    # RED but no parsed signature (an exotic check conclusion) — still
+    # actionable; give the caches a deterministic key.
+    [[ -z "$sig" ]] && sig="RED-unparsed"
+
+    # Sticky-SKIP short-circuit: previously verdicted SKIP and the failing-
+    # check set hasn't changed → known-non-blocking, don't burn another
+    # plan-review cycle.
+    skip_sig="$(get_skip_sig "$repo")"
+    if [[ -n "$skip_sig" && "$skip_sig" == "$sig" ]]; then
+      log "  $(basename "$repo"): SKIP (cached — same fail-sig as previous SKIP verdict)"
+      continue
+    fi
+
+    # Same-failure-N detection per-PR. ESCALATE only after the same
+    # signature has persisted MAX_SAME_FAIL_RETRIES retries in a row
+    # (default 3 — gives the planner a few attempts to diagnose hard
+    # CI failures). (Skipped when the SKIP cache would have matched.)
+    prev_sig="$(get_prev_fail_sig "$repo")"
+    if [[ "$prev_sig" == "$sig" && -n "$sig" ]]; then
+      new_count=$(($(get_same_fail_count "$repo") + 1))
+      set_same_fail_count "$repo" "$new_count"
+      log "  same failure as previous iter ($(basename "$repo")), retry $new_count/$MAX_SAME_FAIL_RETRIES"
+      if [[ "$new_count" -ge "$MAX_SAME_FAIL_RETRIES" ]]; then
+        log "  ESCALATE: same failure on $(basename "$repo") for $((new_count + 1)) consecutive iters — frozen for this run (PR kept: $pr)"
+        set_escalated "$repo"
+        continue
+      fi
+    else
+      set_same_fail_count "$repo" 0
+    fi
+    set_prev_fail_sig "$repo" "$sig"
+
+    any_actionable=true
+    # Block until a parallel slot frees up, then dispatch this repo's full
+    # fix cycle (plan → review → execute → build handoff) as its own job.
+    while [[ "$(live_fix_jobs)" -ge "$MAX_PARALLEL_FIXES" ]]; do sleep 10; done
+    log "  $(basename "$repo"): dispatching fix job ($(( $(live_fix_jobs) + 1 ))/$MAX_PARALLEL_FIXES slots)"
+    fix_one_repo "$repo" "$pr" "$sig" &
+    FIX_PIDS="$FIX_PIDS $!"
+    fix_names="$fix_names $(basename "$repo")"
+  done
+
+  if [[ -n "$FIX_PIDS" ]]; then
+    write_status_file "fix jobs running:${fix_names} — tail the runlog for live progress"
+    log "waiting for fix job(s):${fix_names}"
+    for p in $FIX_PIDS; do wait "$p" 2>/dev/null; done
+    FIX_PIDS=""
+    write_status_file "fix pass done:${fix_names} — repolling next iteration"
+  fi
+
+  # ---- Done conditions ----
   if "$all_done"; then
-    log ""
-    log "=== ALL DONE ==="
-    log "Final state:"
-    jq -r 'to_entries[] | "  \(.key): \(.value)"' "$state_file"
-    # Exit non-zero if any escalated; zero if all green.
-    if jq -e 'to_entries[] | select(.value == "ESCALATED")' "$state_file" >/dev/null; then
+    final_summary "ALL DONE — every watched PR is green or merged"
+    # Exit non-zero if any escalated (state or this-run flag); zero otherwise.
+    if any_escalated; then
       exit 2
     fi
     exit 0
   fi
 
-  if ! "$any_actionable"; then
-    log "all not-green PRs are still pending; sleeping ${WATCH_INTERVAL}s"
+  # STALLED: not done, but nothing to fix, nothing in flight, and no fresh
+  # merges — every remaining red is verdicted "waiting on a later step".
+  # More polling can't make progress; only operator action (merging PRs,
+  # publishing artifacts) can. Exit with the TODO list instead of burning
+  # the remaining iterations. EXIT_ON_STALL=0 restores poll-to-the-cap.
+  if [[ "${EXIT_ON_STALL:-1}" == "1" ]] \
+     && [[ "$any_actionable" == false && "$saw_pending" == false ]] \
+     && [[ ${#merged_this_iter[@]} -eq 0 ]]; then
+    final_summary "STALLED — nothing actionable left; operator action required"
+    exit 3
   fi
 
+  if ! "$any_actionable"; then
+    log "nothing actionable this pass; sleeping ${WATCH_INTERVAL}s"
+  fi
   sleep "$WATCH_INTERVAL"
 done
 
-log ""
-log "ESCALATE: MAX_WATCH_ITERS=$MAX_WATCH_ITERS exhausted; not all PRs green"
-log "Final state:"
-jq -r 'to_entries[] | "  \(.key): \(.value)"' "$state_file"
+final_summary "MAX_WATCH_ITERS=$MAX_WATCH_ITERS exhausted — not all PRs green"
 exit 2
