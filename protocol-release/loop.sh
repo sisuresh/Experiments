@@ -776,7 +776,10 @@ OPERATING MODE (do not deviate):
   then output a single line \`RUN_BUILD: <shell command runnable from the repo
   root>\` as the LAST line and STOP (do not push or open the PR yet). The script
   runs that build, waits for it however long it takes, and re-invokes you with
-  the exit code + log to commit, push, and open the PR.
+  the exit code + log to commit, push, and open the PR. If a command you
+  started gets AUTO-BACKGROUNDED by your harness, do NOT end your turn
+  waiting for its notification — it never arrives in -p mode; emit the
+  RUN_BUILD line for that command instead.
 - Re-recording stellar-core's \`test-tx-meta-baseline-*\` to make CI pass
   is fine (expected when the CAP changes tx semantics or adds tests).
   Inspect the diff; if a tx changed that you did NOT expect, note it in the
@@ -802,7 +805,28 @@ $plan")" || true
   run_build_handoff "$repo" "$exec_out" "Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. If the exit code was non-zero, fix the cause first. The cause may be UPSTREAM, not this repo — if the failure traces to an upstream repo (one earlier in the dep chain, whose PR is already open this run), \`cd\` to that upstream repo, push the fix to its EXISTING PR branch (do NOT open a new PR for it), re-pin THIS repo to the upstream's new head, then request another build. OUTPUT FORMAT: print every PR URL on separate lines at the end (including any upstream PR you pushed to), the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
   exec_out="$RUN_BUILD_RESULT"
 
-  pr_url="$(printf '%s' "$exec_out" | grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -1)"
+  # `|| true`: grep exits 1 on no match, and Phase 1 runs under errexit+pipefail
+  # — an execute turn with no URL in its output used to kill the whole script
+  # SILENTLY right here (first tripped by a turn that ended waiting on an
+  # auto-backgrounded `make generate`).
+  pr_url="$(printf '%s' "$exec_out" | grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -1 || true)"
+
+  # Finish-up retry: a turn that ends waiting on a background job (the harness
+  # auto-backgrounds long commands; the completion notification NEVER arrives
+  # in -p mode) produces no PR URL. Give claude ONE recovery turn — finish
+  # synchronously or hand the long command to RUN_BUILD — before escalating.
+  if [[ -z "$pr_url" ]]; then
+    log "  execute ended without a PR URL — one finish-up re-invoke"
+    exec_out="$(cd "$repo" && ask_claude "Your previous execute turn for $repo ended WITHOUT printing any PR URL. Its final message was:
+$exec_out
+
+You are in -p mode: any background/monitored job you were waiting on will NEVER notify you — that turn is over. Finish the job NOW:
+- If a long build/regen still needs to (re)run, emit a single \`RUN_BUILD: <cmd>\` line as your LAST line and STOP — the script runs it and re-invokes you.
+- Otherwise: inspect the working tree, complete the remaining plan steps, commit, push to the release branch, make sure the draft PR exists per the contract, and print every PR URL on separate lines at the end, the FIRST being the PR for $repo.")" || true
+    run_build_handoff "$repo" "$exec_out" "Now: fix any build fallout, commit ALL changes (including build-generated files) on the release branch, push, and open the draft PR per the contract. OUTPUT FORMAT: print every PR URL on separate lines at the end, the FIRST being the PR for $repo. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
+    exec_out="$RUN_BUILD_RESULT"
+    pr_url="$(printf '%s' "$exec_out" | grep -oE 'https://github\.com/[^/]+/[^/]+/pull/[0-9]+' | head -1 || true)"
+  fi
 
   if [[ "$pr_url" =~ ^https://github\.com/.+/pull/[0-9]+$ ]]; then
     state_set "$repo" "$pr_url"
@@ -1133,7 +1157,10 @@ Build + run tests locally to validate BEFORE pushing:
   re-invoked, so a backgrounded build strands the run. Make ALL edits first,
   then emit a single \`RUN_BUILD: <cmd>\` line as your LAST line and STOP (do not
   push yet). The script runs it, waits however long it takes, and re-invokes you
-  with the result to commit + push.
+  with the result to commit + push. If a command you started gets
+  AUTO-BACKGROUNDED by your harness, do NOT end your turn waiting for its
+  notification (it never arrives in -p mode) — emit the RUN_BUILD line for
+  that command instead.
 - For stellar-core, request an INCREMENTAL build that reuses the already-built
   in-tree objects + ccache: \`make -j\$(nproc)\` (run \`./configure
   --enable-next-protocol-version-unsafe-for-production\` only if there's no
