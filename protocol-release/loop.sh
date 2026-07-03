@@ -398,8 +398,12 @@ find_or_propose_repo_for_pr() {
   local nwo r remote
   nwo="$(printf '%s' "$pr" | sed -E 's|https://github\.com/([^/]+/[^/]+)/pull/.*|\1|')"
   for r in "${SCOPE[@]}"; do
-    remote="$(cd "$r" 2>/dev/null && git config --get remote.origin.url 2>/dev/null || true)"
-    if printf '%s' "$remote" | grep -qiE "[/:]${nwo}(\.git)?\$"; then
+    # Match against ALL remotes, not just origin: these checkouts have
+    # origin=<fork> while the PR lives on the stellar/* upstream, so an
+    # origin-only match mis-mapped every harvested upstream PR to a fresh
+    # clones/ path — duplicate state keys for the same PR.
+    remote="$(cd "$r" 2>/dev/null && git remote -v 2>/dev/null | awk '{print $2}' | sort -u || true)"
+    if printf '%s\n' "$remote" | grep -qiE "[/:]${nwo}(\.git)?\$"; then
       printf '%s' "$r"; return 0
     fi
   done
@@ -749,6 +753,15 @@ EACH repo named in the plan:
      control, and open a DRAFT PR.
   3. Cross-link every PR you open to the others in this run.
 
+SCOPE LIMIT — upstream ONLY: open PRs solely for $repo and for repos
+that are UPSTREAM dependencies of it (earlier in the dependency chain).
+NEVER open PRs for DOWNSTREAM repos (later targets — SDKs, services,
+UIs that consume this repo), even if their work seems obvious or old
+release branches for them exist locally: each target gets its own
+dedicated plan/review pass later in this run, and pre-opening it with
+copied or stale content bypasses that pass. One run opened all 11
+downstream PRs from a single turn this way — do not repeat it.
+
 OPERATING MODE (do not deviate):
 
 - START FROM A FRESH BASE: before any edits, fetch the upstream and check out
@@ -922,12 +935,29 @@ any_escalated() {
 # iteration: parallel fix jobs run in subshells, so a `SCOPE+=` there would be
 # lost — they record new upstream PRs in the STATE FILE instead, and this
 # picks them up.
+# DEDUP BY PR URL: two state keys can point at the SAME PR (e.g. a harvested
+# clones/ mapping plus the real ~/dev checkout). Watching both would spawn two
+# parallel fix jobs on one PR. Keep only the first key per URL — targets
+# (~/dev, dep order) come first, so the real checkout always wins.
 rebuild_scope() {
   SCOPE=("${TARGETS[@]}")
-  local k
+  local k u seen_urls=""
+  for k in "${TARGETS[@]}"; do
+    u="$(state_get "$k")"
+    [[ -n "$u" && "$u" != "ESCALATED" ]] && seen_urls="$seen_urls $u"
+  done
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
-    in_scope "$k" || SCOPE+=("$k")
+    in_scope "$k" && continue
+    u="$(state_get "$k")"
+    if [[ -n "$u" && "$u" != "ESCALATED" ]]; then
+      case " $seen_urls " in
+        *" $u "*)
+          continue ;;   # same PR already watched under an earlier key
+      esac
+      seen_urls="$seen_urls $u"
+    fi
+    SCOPE+=("$k")
   done < <(jq -r 'keys_unsorted[]' "$state_file" 2>/dev/null)
 }
 
