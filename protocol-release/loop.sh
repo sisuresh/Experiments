@@ -195,6 +195,9 @@ state_file="$STATE_DIR/${inputs_id}.json"
 # At-a-glance status table, rewritten every watch poll pass. `cat` (or
 # `watch cat`) this instead of scrolling the runlog.
 STATUS_FILE="$STATE_DIR/${inputs_id}-status.txt"
+# Per-call claude token usage (TSV), one row per ask_claude turn — see ask_claude.
+TOKEN_LOG="$LOG_DIR/${ts}-tokens.tsv"
+printf 'time\tsession\teffort\tin\tout\tcache_read\tcache_create\tcost_usd\tcallfile\n' > "$TOKEN_LOG"
 # Per-iteration poll results, one file per repo: "MSTATE\tSTATUS\tSIG".
 POLL_DIR="$WORK_DIR/.poll"
 # Cross-PR context cache: rebuilt once per watch iteration from the poll
@@ -257,6 +260,7 @@ log "State:     $state_file"
 log "Workdir:   $WORK_DIR"
 log "Run log:   $runlog"
 log "Status:    $STATUS_FILE   (rewritten every watch poll pass — 'watch cat' it)"
+log "Tokens:    $TOKEN_LOG   (per-call token usage, TSV)"
 log "Parallel:  up to $MAX_PARALLEL_FIXES concurrent fix jobs (MAX_PARALLEL_FIXES)"
 log ""
 log "To watch live LLM output in another terminal:"
@@ -346,9 +350,28 @@ ask_claude() {
       : > "$STATE_DIR/.sess-$CLAUDE_SESSION_ID"
     fi
   fi
-  log "  → claude ($CLAUDE_MODEL, effort=${REPO_EFFORT:-$DEFAULT_EFFORT}${smsg}) streaming. Watch: tail -f $f"
-  # ${sflag[@]+...} guard: safe empty-array expansion under `set -u` on bash 3.2.
-  claude --model "$CLAUDE_MODEL" --effort "${REPO_EFFORT:-$DEFAULT_EFFORT}" ${sflag[@]+"${sflag[@]}"} -p "$1" | tee "$f"
+  log "  → claude ($CLAUDE_MODEL, effort=${REPO_EFFORT:-$DEFAULT_EFFORT}${smsg}) — reply to $f on completion"
+  # --output-format json so we can record per-call token usage. `.result` is the
+  # text callers expect on stdout; `.usage`/`.total_cost_usd` go to $TOKEN_LOG
+  # plus a runlog line. If claude emits non-result output (the plain-text spend-
+  # limit notice, or an error), fall through and pass it straight on so the
+  # caller's existing no-URL / escalate handling still fires. Tradeoff vs. the
+  # old text mode: the reply lands in $f on completion, not streamed live.
+  # ${sflag[@]+...}: safe empty-array expansion under `set -u` on bash 3.2.
+  local raw text row
+  raw="$(claude --model "$CLAUDE_MODEL" --effort "${REPO_EFFORT:-$DEFAULT_EFFORT}" ${sflag[@]+"${sflag[@]}"} --output-format json -p "$1")" || true
+  if text="$(printf '%s' "$raw" | jq -er '.result' 2>/dev/null)"; then
+    printf '%s\n' "$text" > "$f"
+    row="$(printf '%s' "$raw" | jq -r \
+      --arg t "$(date '+%H:%M:%S')" --arg s "${CLAUDE_SESSION_ID:0:8}" \
+      --arg e "${REPO_EFFORT:-$DEFAULT_EFFORT}" --arg fn "$(basename "$f")" \
+      '[$t,$s,$e,(.usage.input_tokens//0),(.usage.output_tokens//0),(.usage.cache_read_input_tokens//0),(.usage.cache_creation_input_tokens//0),(.total_cost_usd//0),$fn]|@tsv')"
+    printf '%s\n' "$row" >> "$TOKEN_LOG"
+    log "    ← tokens $(printf '%s' "$row" | awk -F'\t' '{printf "in=%s out=%s cache_read=%s cost=$%s",$4,$5,$6,$8}')"
+    printf '%s' "$text"
+  else
+    printf '%s' "$raw" | tee "$f"
+  fi
 }
 ask_copilot_gpt() {
   local f="$LOG_DIR/${ts}-copilot-$(date +%H%M%S)-$RANDOM.txt"
