@@ -112,6 +112,9 @@ REVIEWER_MODEL="${REVIEWER_MODEL:-gpt-5.5}"
 # which overrides any inherited CLAUDE_EFFORT/settings default.
 DEFAULT_EFFORT="${DEFAULT_EFFORT:-high}"
 MAX_EFFORT_REPOS="${MAX_EFFORT_REPOS:-rs-soroban-env stellar-core}"
+# Effort for the heavy-reasoning repos in MAX_EFFORT_REPOS. Was 'max'; 'xhigh'
+# is a large cost cut with modest quality loss on the two hardest repos.
+MAX_EFFORT="${MAX_EFFORT:-xhigh}"
 REPO_EFFORT="$DEFAULT_EFFORT"   # current repo's effort; reset per repo below
 MAX_WATCH_ITERS="${MAX_WATCH_ITERS:-60}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-120}"
@@ -181,8 +184,9 @@ mkdir -p "$LOG_DIR" "$STATE_DIR" "$WORK_DIR"
 # Fail-state from a previous run would otherwise immediately escalate any
 # still-red PR on the first watch pass of this run (same signature wins).
 rm -f "$WORK_DIR"/.fail-state.*
-# Stale locks / poll table from a previous (killed) run.
+# Stale locks / poll table / claude-session markers from a previous (killed) run.
 rm -rf "$STATE_DIR"/.lock-* "$WORK_DIR/.poll"
+rm -f "$STATE_DIR"/.sess-* 2>/dev/null || true
 
 ts="$(date +%Y%m%d-%H%M%S)"
 inputs_id="$(printf '%s' "$(readlink -f "$INPUTS" 2>/dev/null || echo "$INPUTS")" | sha1)"
@@ -314,15 +318,37 @@ state_set() {  # state_set <repo-path> <value>
 effort_for_repo() {
   local name r; name="$(basename "$1")"
   for r in $MAX_EFFORT_REPOS; do
-    [[ "$name" == "$r" || "$name" == *"--$r" ]] && { printf 'max'; return; }
+    [[ "$name" == "$r" || "$name" == *"--$r" ]] && { printf '%s' "$MAX_EFFORT"; return; }
   done
   printf '%s' "$DEFAULT_EFFORT"
 }
 
+# A fresh lowercased UUID for a per-repo claude session (see ask_claude).
+new_session_id() { uuidgen | tr 'A-Z' 'a-z'; }
+
+# ask_claude runs one non-interactive claude turn. When CLAUDE_SESSION_ID is set
+# (open_pr_for_repo / fix_one_repo assign a fresh one per repo), the FIRST call
+# in that repo unit CREATES the session (--session-id) and every later call
+# RESUMES it (--resume) — so plan → execute → RUN_BUILD re-invokes share one
+# conversation instead of each re-reading the docs and re-exploring the repo
+# from scratch. First-vs-resume is tracked with an on-disk marker, because every
+# ask_claude call runs inside $(command substitution): a shell variable set
+# there wouldn't survive to the next call, but a marker file does. Calls within
+# one repo unit are sequential, so no locking is needed. Unset id → old behavior.
 ask_claude() {
   local f="$LOG_DIR/${ts}-claude-$(date +%H%M%S)-$RANDOM.txt"
-  log "  → claude ($CLAUDE_MODEL, effort=${REPO_EFFORT:-$DEFAULT_EFFORT}) streaming. Watch: tail -f $f"
-  claude --model "$CLAUDE_MODEL" --effort "${REPO_EFFORT:-$DEFAULT_EFFORT}" -p "$1" | tee "$f"
+  local sflag=() smsg=""
+  if [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then
+    if [[ -f "$STATE_DIR/.sess-$CLAUDE_SESSION_ID" ]]; then
+      sflag=(--resume "$CLAUDE_SESSION_ID"); smsg=" resume ${CLAUDE_SESSION_ID:0:8}"
+    else
+      sflag=(--session-id "$CLAUDE_SESSION_ID"); smsg=" new-session ${CLAUDE_SESSION_ID:0:8}"
+      : > "$STATE_DIR/.sess-$CLAUDE_SESSION_ID"
+    fi
+  fi
+  log "  → claude ($CLAUDE_MODEL, effort=${REPO_EFFORT:-$DEFAULT_EFFORT}${smsg}) streaming. Watch: tail -f $f"
+  # ${sflag[@]+...} guard: safe empty-array expansion under `set -u` on bash 3.2.
+  claude --model "$CLAUDE_MODEL" --effort "${REPO_EFFORT:-$DEFAULT_EFFORT}" ${sflag[@]+"${sflag[@]}"} -p "$1" | tee "$f"
 }
 ask_copilot_gpt() {
   local f="$LOG_DIR/${ts}-copilot-$(date +%H%M%S)-$RANDOM.txt"
@@ -726,6 +752,11 @@ $reinvoke")" || true
 open_pr_for_repo() {
   local repo="$1"
   local existing plan pr_url
+  # One claude session for this repo's whole pipeline (plan → execute → builds
+  # → finish-up), so later turns reuse the earlier ones' context instead of
+  # re-reading the docs and re-exploring the repo. local → dynamic scoping makes
+  # it visible to ask_claude/plan_then_review/run_build_handoff called below.
+  local CLAUDE_SESSION_ID; CLAUDE_SESSION_ID="$(new_session_id)"
   REPO_EFFORT="$(effort_for_repo "$repo")"
   existing="$(state_get "$repo")"
   if [[ -n "$existing" && "$existing" != "ESCALATED" ]]; then
@@ -1084,6 +1115,10 @@ fix_one_repo() {
   local repo="$1" pr="$2" fail_sig="$3"
   local LOG_PREFIX="[$(basename "$repo")] "
   local REPO_EFFORT; REPO_EFFORT="$(effort_for_repo "$repo")"
+  # Per-fix-job claude session (its own UUID → own marker file), so parallel fix
+  # jobs never share context and the plan → execute → builds chain here reuses
+  # its own turns. See ask_claude / open_pr_for_repo.
+  local CLAUDE_SESSION_ID; CLAUDE_SESSION_ID="$(new_session_id)"
   local fail_log fix_task fix_plan investigate_n inv_line first_line fix_out
   local new_url new_path
 
