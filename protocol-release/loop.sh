@@ -5,6 +5,15 @@
 # Single invocation processes every in-scope repo:
 #   1. OPEN phase  — for each repo in dep order: plan_then_review →
 #                    claude opens a draft PR. PR URLs recorded in state.
+#   1.5 REFRESH    — for each ALREADY-OPEN PR in dep order: if its branch
+#                    is DIRTY/BEHIND vs its base, or an upstream PR branch
+#                    was refreshed earlier in this same pass, claude brings
+#                    it current: MERGE the base into the existing branch
+#                    (append-only — never rebase, never force-push), repin
+#                    to refreshed upstream heads, regenerate generated
+#                    files, rebuild, plain-push. Top-down order makes the
+#                    refresh cascade down the dep chain. Makes re-runs
+#                    converge on a stale stack. REFRESH=0 skips.
 #   2. WATCH phase — each iteration is two passes:
 #                    POLL pass: ONE gh fetch per PR classifies it
 #                    (GREEN/PENDING/RED + OPEN/MERGED/CLOSED + failing-check
@@ -83,6 +92,9 @@
 #   DRY_WATCH         Set 1 to run a single poll pass (no fixes, no LLM calls
 #                     in the watch phase), print the status summary, and exit.
 #                     Cheap "where does the release stand right now" command.
+#   REFRESH           Default 1: run the Phase-1.5 refresh pass over already-
+#                     open PRs (merge base in / repin to refreshed upstreams;
+#                     see phase list above). Set 0 to skip straight to WATCH.
 #   IGNORED_CHECKS    Comma-separated check names treated as non-blocking when
 #                     polling PR CI. These are checks that legitimately fail
 #                     on protocol-next PRs and shouldn't drag the watch loop
@@ -114,8 +126,8 @@ DEFAULT_EFFORT="${DEFAULT_EFFORT:-high}"
 MAX_EFFORT_REPOS="${MAX_EFFORT_REPOS:-rs-soroban-env stellar-core}"
 # Effort for the heavy-reasoning repos in MAX_EFFORT_REPOS. Was 'max'; 'xhigh'
 # is a large cost cut with modest quality loss on the two hardest repos.
-MAX_EFFORT="${MAX_EFFORT:-xhigh}"
-REPO_EFFORT="$DEFAULT_EFFORT"   # current repo's effort; reset per repo below
+MAX_EFFORT="${MAX_EFFORT:-high}"
+REPO_EFFORT="$DEFAULT_EFFORT"    # current repo's effort; reset per repo below
 MAX_WATCH_ITERS="${MAX_WATCH_ITERS:-60}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-120}"
 # Cap on plan-revise rounds inside plan_then_review. Default 1: a single
@@ -677,21 +689,30 @@ _check_state_jq='
 #             PENDING at least one check running/queued (or none reported yet)
 #             RED     a real failure, nothing pending
 #             UNKNOWN couldn't read CI after retries (treat as pending, NEVER red)
+#   DRIFT   — GitHub mergeStateStatus (CLEAN/DIRTY/BEHIND/BLOCKED/UNSTABLE/
+#             UNKNOWN). DIRTY/BEHIND = the branch has drifted from its base
+#             and needs a refresh even if CI is green — surfaced in the
+#             status table + planner context; Phase 1.5 acts on it at startup.
 #   SIG     — stable failing-check signature (sorted "name[state]", no URLs;
-#             empty unless RED). Same key the SKIP cache uses.
+#             empty unless RED). Same key the SKIP cache uses. LAST field on
+#             purpose: it's the only one that can be empty, and tab is IFS
+#             whitespace — `read` collapses an empty middle field and would
+#             shift the fields after it left by one.
 # One fetch (not separate green/pending/state calls) so a gh burst can't break
 # one check but not another and misread a green PR as RED — and the whole
 # iteration costs N calls instead of ~4N.
 poll_pr() {
-  local pr="$1" payload="" t mstate states status sig
+  local pr="$1" payload="" t mstate states status sig drift
   for t in 1 2 3; do
-    payload="$(gh pr view "$pr" --json state,statusCheckRollup 2>/dev/null)"
+    payload="$(gh pr view "$pr" --json state,mergeStateStatus,statusCheckRollup 2>/dev/null)"
     [[ -n "$payload" ]] && break
     sleep 5
   done
-  if [[ -z "$payload" ]]; then printf 'UNKNOWN\tUNKNOWN\t\n'; return; fi
+  if [[ -z "$payload" ]]; then printf 'UNKNOWN\tUNKNOWN\tUNKNOWN\t\n'; return; fi
   mstate="$(printf '%s' "$payload" | jq -r '.state // "UNKNOWN"' 2>/dev/null)"
   [[ -z "$mstate" ]] && mstate="UNKNOWN"
+  drift="$(printf '%s' "$payload" | jq -r '.mergeStateStatus // "UNKNOWN"' 2>/dev/null)"
+  [[ -z "$drift" ]] && drift="UNKNOWN"
   states="$(printf '%s' "$payload" | jq -r --argjson ignored "$IGNORED_CHECKS_JSON" "$_check_state_jq | .[]?" 2>/dev/null)"
   if [[ -z "$states" ]]; then
     status="PENDING"
@@ -714,7 +735,7 @@ poll_pr() {
         | select(.s | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED","STALE"))
         | "\(.n)[\(.s)]"] | sort | join(",")' 2>/dev/null)"
   fi
-  printf '%s\t%s\t%s\n' "$mstate" "$status" "$sig"
+  printf '%s\t%s\t%s\t%s\n' "$mstate" "$status" "$drift" "$sig"
 }
 
 # Per-repo poll-result file for the current iteration.
@@ -936,11 +957,8 @@ else
 fi
 
 # =============================================================
-# Phase 2: WATCH — poll all open PRs; route fixes via planner
+# Per-repo bookkeeping (used by both REFRESH and WATCH below)
 # =============================================================
-log ""
-log "=== Phase 2: WATCH ==="
-
 # Per-repo failure tracking. Bash 3.2 lacks associative arrays, so we
 # stash this state under $WORK_DIR/.fail-sig.<sanitized-repo>.
 fail_state_file() {
@@ -984,6 +1002,202 @@ any_escalated() {
   ls "$WORK_DIR"/.fail-state.*.escalated >/dev/null 2>&1
 }
 
+# =============================================================
+# Phase 1.5: REFRESH — bring already-open PRs current, top-down
+# =============================================================
+# Phase 1 skips a repo whose PR is already open, and the watch phase only
+# acts on CI-red PRs — so on a re-run against a stale stack, an open PR
+# whose base moved (or whose upstream pin went stale) used to sit untouched
+# until a check happened to fail. This pass walks TARGETS in dep order and
+# refreshes each open PR that needs it. Two triggers:
+#   - base drift: mergeStateStatus DIRTY (conflicts) or BEHIND (stale)
+#   - upstream cascade: any upstream PR branch was pushed earlier in this
+#     SAME pass — the downstream must repin to its new head. No manifest
+#     parsing (Cargo.toml rev vs go.mod vs package.json): the script knows
+#     what it just pushed, and top-down order makes each layer see the
+#     refreshed heads above it.
+# The refresh itself is claude executing a merge-based update: merge the
+# base INTO the existing branch and plain-push — history on a published PR
+# branch is append-only (NEVER rebase, NEVER force-push). Straight to
+# execute (no plan round) since this is mostly mechanical; a genuinely
+# semantic conflict escapes via REFRESH-BLOCKED and gets ONE
+# plan_then_review fallback before the repo is escalated to the operator.
+# Side PRs harvested under clones/ state keys (not in TARGETS) are left to
+# the watch phase — they aren't part of the dep chain.
+
+# Cumulative "- repo: URL — branch refreshed; new head SHA" lines, appended
+# after each successful push this pass; every later refresh prompt sees it.
+REFRESHED_UPSTREAMS=""
+
+refresh_pr_for_repo() {
+  local repo="$1"
+  local url meta pstate drift headref headoid baseref reason upstream_ctx
+  local exec_out newoid reinvoke fb_plan
+  url="$(state_get "$repo")"
+  [[ -z "$url" || "$url" == "ESCALATED" ]] && return 0
+  meta="$(gh pr view "$url" --json state,mergeStateStatus,headRefName,headRefOid,baseRefName \
+    --jq '[.state,.mergeStateStatus,.headRefName,.headRefOid,.baseRefName] | @tsv' 2>/dev/null || true)"
+  if [[ -z "$meta" ]]; then
+    log "$(basename "$repo"): can't read PR meta (transient gh error?) — skipping refresh: $url"
+    return 0
+  fi
+  IFS=$'\t' read -r pstate drift headref headoid baseref <<< "$meta"
+  case "$pstate" in
+    MERGED)
+      log "$(basename "$repo"): MERGED — nothing to refresh"
+      return 0 ;;
+    CLOSED)
+      log "WARNING: $(basename "$repo") PR was CLOSED without merging — escalating (operator intervened?): $url"
+      set_escalated "$repo"
+      return 0 ;;
+  esac
+
+  reason=""
+  case "$drift" in
+    DIRTY)  reason="branch conflicts with base '$baseref' (mergeStateStatus=DIRTY)" ;;
+    BEHIND) reason="branch is behind base '$baseref' (mergeStateStatus=BEHIND)" ;;
+  esac
+  [[ -n "$REFRESHED_UPSTREAMS" ]] && reason="${reason:+$reason; }upstream PR branch(es) refreshed earlier this pass"
+  if [[ -z "$reason" ]]; then
+    log "$(basename "$repo"): up-to-date (mergeStateStatus=$drift, no refreshed upstreams) — skip"
+    return 0
+  fi
+
+  upstream_ctx="${REFRESHED_UPSTREAMS:-(none)}"
+  # Own claude session per repo (same pattern as open_pr_for_repo): execute →
+  # RUN_BUILD re-invokes → fallback share one conversation via dynamic scoping.
+  local CLAUDE_SESSION_ID; CLAUDE_SESSION_ID="$(new_session_id)"
+  REPO_EFFORT="$(effort_for_repo "$repo")"
+  log "---"
+  log "REFRESH: $repo"
+  log "  why: $reason"
+
+  reinvoke="Now: fix any build fallout, commit ALL changes (including regenerated files) as NEW commits on the existing branch '$headref', and push with a plain \`git push\` — NEVER rebase or force-push, do NOT open a new PR. If the exit code was non-zero, fix the cause first. OUTPUT FORMAT: end with the PR URL $url on its own line. To request ANOTHER build, output a single \`RUN_BUILD: <cmd>\` line as the very last line and stop."
+
+  exec_out="$(cd "$repo" && ask_claude "Refresh this repo's EXISTING open draft PR so it is current with its base branch and with this run's upstream PRs. Do NOT open a new PR.
+
+Working repo: $repo
+PR:           $url   (branch '$headref' → base '$baseref', current head $headoid)
+Why refresh:  $reason
+
+Inputs file:  $INPUTS
+Contract:     $CONTRACT
+Lessons:      $LESSONS
+
+Read the contract, the lessons file, and the inputs first — the lessons
+file captures per-repo traps (regen post-processing, branch quirks,
+truncated SHAs) that apply directly to this kind of merge/repin work.
+
+Upstream PR branches already refreshed earlier in this pass (dep order,
+top-down). If this repo pins any of them by git rev/commit, repin to the
+new head SHA listed and refresh the lockfile:
+$upstream_ctx
+
+Open PRs in this run:
+$(open_prs_context)
+
+OPERATING MODE (do not deviate):
+1. SYNC: fetch the base remote and the fork remote, check out the PR's
+   existing branch '$headref', and make the local branch exactly match
+   the PR's current remote head ($headoid) before editing anything.
+2. MERGE, DON'T REBASE: bring the branch current by MERGING the latest
+   base '$baseref' INTO '$headref' (git merge). History on the PR branch
+   is append-only: NEVER rebase it, NEVER amend or drop pushed commits,
+   NEVER force-push (no --force, no --force-with-lease).
+3. CONFLICTS:
+   - Generated files (XDR bindings, codegen output, lockfiles): resolve
+     by REGENERATING from the merged sources — never hand-merge hunks.
+   - Dependency pins on this run's upstream PRs: repin to the refreshed
+     head SHAs listed above (those heads already contain the base's new
+     work, e.g. other CAPs that merged to the base after this PR opened).
+   - Keep BOTH this PR's changes and everything new from the base. Never
+     resolve a conflict by dropping a base-side feature or another CAP's
+     flag/feature — combine them.
+4. VERIFY: run the quick build/tests synchronously. If a LONG build is
+   required, make all edits first, then output a single line
+   \`RUN_BUILD: <shell command runnable from the repo root>\` as the LAST
+   line and STOP — the script runs it and re-invokes you. (Background
+   jobs never notify in -p mode; hand long commands to RUN_BUILD instead
+   of waiting.)
+5. PUSH: plain \`git push\` of the new commits to the SAME branch on the
+   SAME fork remote the PR head lives on — the PR updates in place.
+   Do NOT open a new PR, do NOT push any other branch, do NOT merge or
+   close the PR.
+6. If the PR description's pin/SHA references are now stale, update the
+   description (gh pr edit) — keep the title unchanged.
+
+ESCAPE HATCHES (machine-parsed — put the keyword on its own line):
+- If after inspecting you conclude the branch is ALREADY current (no
+  merge needed, no repin needed), output the single line
+  NO-REFRESH-NEEDED and stop.
+- If a conflict is NOT mechanically resolvable (a semantic collision
+  between this PR's changes and something that landed on the base), do
+  NOT push a half-resolved merge. Output a line starting with
+  'REFRESH-BLOCKED: <one-line reason>' followed by what you found, and
+  stop.
+
+OUTPUT FORMAT (strict): unless you used an escape hatch above, end your
+reply with the PR URL on its own line after pushing: $url")" || true
+  run_build_handoff "$repo" "$exec_out" "$reinvoke"
+  exec_out="$RUN_BUILD_RESULT"
+
+  # Non-mechanical conflict: ONE plan_then_review fallback (the planner can
+  # sequence an upstream-first fix — e.g. refresh the upstream PR branch so
+  # a single rev with both features exists, then repin here) before we give
+  # up and hand the repo to the operator.
+  if printf '%s' "$exec_out" | grep -qE '^\**REFRESH-BLOCKED:'; then
+    log "  refresh blocked (non-mechanical conflict) — one plan_then_review fallback round"
+    fb_plan="$(plan_then_review "Refreshing the existing open PR $url for $(basename "$repo") (branch '$headref' → base '$baseref') is blocked on a non-mechanical merge conflict. A first refresh attempt reported:
+
+$exec_out
+
+Plan how to bring this PR branch current while keeping BOTH the PR's changes and the base's new work: merge '$baseref' into '$headref' (append-only history — NO rebase, NO force-push), resolve the semantic conflict, and repin git-rev deps to this run's refreshed upstream heads:
+$upstream_ctx
+
+The fix may require pushing to an UPSTREAM PR branch from this run FIRST (e.g. refresh the upstream branch so a single rev containing both features exists), then repinning here — plan that sequencing explicitly. Push only NEW commits to EXISTING PR branches; never open a new PR." "$repo")"
+    exec_out="$(cd "$repo" && ask_claude "Apply the plan in full. Reminder — merge-only workflow: NEVER rebase or force-push any PR branch; push new commits with a plain \`git push\` to each PR's existing branch; do NOT open new PRs. For a LONG build, make all edits first and output a single \`RUN_BUILD: <cmd>\` line as the very last line, then stop. OUTPUT FORMAT: end with the PR URL $url on its own line after pushing, or a 'REFRESH-BLOCKED: <reason>' line if genuinely stuck.
+
+PLAN:
+$fb_plan")" || true
+    run_build_handoff "$repo" "$exec_out" "$reinvoke"
+    exec_out="$RUN_BUILD_RESULT"
+  fi
+
+  # Did anything actually land on the PR branch? Judge by head SHA, not by
+  # what the reply claims — a turn that ended waiting on a background job
+  # pushes nothing.
+  newoid="$(gh pr view "$url" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+  if [[ -n "$newoid" && "$newoid" != "$headoid" ]]; then
+    log "  refreshed: '$headref' ${headoid:0:8} → ${newoid:0:8}"
+    REFRESHED_UPSTREAMS="${REFRESHED_UPSTREAMS}- $(basename "$repo"): $url — PR branch '$headref' refreshed; repin any git-rev dep on it to new head SHA $newoid"$'\n'
+  elif printf '%s' "$exec_out" | grep -qiE '^\**NO-REFRESH-NEEDED\b'; then
+    log "  $(basename "$repo"): NO-REFRESH-NEEDED — leaving as-is"
+  elif [[ "$drift" == "DIRTY" ]]; then
+    log "  WARNING: $(basename "$repo") still conflicts with '$baseref' and refresh pushed nothing — escalating (operator must resolve): $url"
+    set_escalated "$repo"
+  else
+    log "  WARNING: $(basename "$repo") refresh pushed nothing (head unchanged at ${headoid:0:8}) — leaving to the watch phase: $url"
+  fi
+}
+
+log ""
+log "=== Phase 1.5: REFRESH (existing open PRs) ==="
+if [[ "${DRY_WATCH:-0}" == "1" ]]; then
+  log "DRY_WATCH: skipping refresh (nothing is pushed in a dry run)"
+elif [[ "${REFRESH:-1}" != "1" ]]; then
+  log "REFRESH=0: skipping refresh pass"
+else
+  for repo in "${TARGETS[@]}"; do
+    refresh_pr_for_repo "$repo"
+  done
+fi
+
+# =============================================================
+# Phase 2: WATCH — poll all open PRs; route fixes via planner
+# =============================================================
+log ""
+log "=== Phase 2: WATCH ==="
+
 # SCOPE = Targets ∪ state-file keys, targets first (dep order), state-only
 # entries appended in insertion order. Rebuilt at the top of every watch
 # iteration: parallel fix jobs run in subshells, so a `SCOPE+=` there would be
@@ -1018,7 +1232,7 @@ rebuild_scope() {
 # Rewrite the at-a-glance status table ($STATUS_FILE) from the current poll
 # table. $1 = one-line activity note (what the loop is doing right now).
 write_status_file() {
-  local note="${1:-}" tmp repo url f mstate status sig disp extra sk
+  local note="${1:-}" tmp repo url f mstate status sig drift disp extra sk
   tmp="$(mktemp)"
   {
     printf '%s — iter %s/%s @ %s\n' "$(basename "$INPUTS")" "${iter:-0}" "$MAX_WATCH_ITERS" "$(date '+%F %T')"
@@ -1035,8 +1249,8 @@ write_status_file() {
         continue
       fi
       f="$(poll_file "$repo")"
-      mstate=""; status="?"; sig=""
-      [[ -f "$f" ]] && IFS=$'\t' read -r mstate status sig < "$f"
+      mstate=""; status="?"; sig=""; drift=""
+      [[ -f "$f" ]] && IFS=$'\t' read -r mstate status drift sig < "$f"
       disp="$status"; extra=""
       if is_escalated "$repo"; then
         disp="ESCALATED"; extra="frozen this run — operator must inspect"
@@ -1051,6 +1265,12 @@ write_status_file() {
           extra="failing: $sig"
         fi
       fi
+      # Branch drift is orthogonal to CI state: a CI-green PR can still be
+      # unmergeable (DIRTY) or stale (BEHIND). Flag it so the operator never
+      # reads GREEN as "ready to merge" when the branch needs a refresh.
+      if [[ "$mstate" == "OPEN" ]] && [[ "$drift" == "DIRTY" || "$drift" == "BEHIND" ]]; then
+        extra="${extra:+$extra   }[branch $drift vs base — needs refresh]"
+      fi
       printf '%-13s %-26s %s%s\n' "$disp" "$(basename "$repo")" "$url" "${extra:+   $extra}"
     done
   } > "$tmp" && mv "$tmp" "$STATUS_FILE"
@@ -1061,7 +1281,7 @@ write_status_file() {
 # saying what a human must do next — never just a state dump.
 final_summary() {
   local headline="$1"
-  local repo url f mstate status sig reason has_core_open=false
+  local repo url f mstate status sig drift reason has_core_open=false
   log ""
   log "=== $headline ==="
   for repo in "${SCOPE[@]}"; do
@@ -1075,8 +1295,8 @@ final_summary() {
       continue
     fi
     f="$(poll_file "$repo")"
-    mstate=""; status="?"; sig=""
-    [[ -f "$f" ]] && IFS=$'\t' read -r mstate status sig < "$f"
+    mstate=""; status="?"; sig=""; drift=""
+    [[ -f "$f" ]] && IFS=$'\t' read -r mstate status drift sig < "$f"
     case "$(basename "$repo")" in
       stellar-core|*--stellar-core) [[ "$mstate" != "MERGED" ]] && has_core_open=true ;;
     esac
@@ -1087,7 +1307,11 @@ final_summary() {
     if [[ "$mstate" == "MERGED" ]]; then
       log "  ✅ $(basename "$repo"): MERGED  $url"
     elif [[ "$status" == "GREEN" ]]; then
-      log "  🟢 $(basename "$repo"): GREEN — ready to merge  $url"
+      if [[ "$drift" == "DIRTY" || "$drift" == "BEHIND" ]]; then
+        log "  🟢 $(basename "$repo"): GREEN but branch $drift vs base — re-run to refresh before merging  $url"
+      else
+        log "  🟢 $(basename "$repo"): GREEN — ready to merge  $url"
+      fi
     elif [[ "$status" == "RED" ]]; then
       if [[ -n "$(get_skip_sig "$repo")" ]]; then
         reason="$(get_skip_reason "$repo" | cut -c1-200)"
@@ -1338,7 +1562,7 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
     [[ -z "$pr" || "$pr" == "ESCALATED" ]] && continue
     line="$(poll_pr "$pr")"
     printf '%s\n' "$line" > "$(poll_file "$repo")"
-    IFS=$'\t' read -r mstate status sig <<< "$line"
+    IFS=$'\t' read -r mstate status drift sig <<< "$line"
 
     if [[ "$mstate" == "MERGED" ]]; then
       if [[ "$(get_pr_prev_state "$repo")" != "MERGED" ]]; then
@@ -1402,8 +1626,10 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
     fi
     pf="$(poll_file "$repo")"
     if [[ -f "$pf" ]]; then
-      IFS=$'\t' read -r mstate status sig < "$pf"
-      OPEN_PRS_CACHE="${OPEN_PRS_CACHE}- $repo: $url [$mstate, CI=$status${sig:+, failing: $sig}]"$'\n'
+      IFS=$'\t' read -r mstate status drift sig < "$pf"
+      dnote=""
+      [[ "$drift" == "DIRTY" || "$drift" == "BEHIND" ]] && dnote=", branch $drift vs base"
+      OPEN_PRS_CACHE="${OPEN_PRS_CACHE}- $repo: $url [$mstate, CI=$status${sig:+, failing: $sig}$dnote]"$'\n'
     else
       OPEN_PRS_CACHE="${OPEN_PRS_CACHE}- $repo: $url [not polled]"$'\n'
     fi
@@ -1430,7 +1656,7 @@ for iter in $(seq 1 "$MAX_WATCH_ITERS"); do
     is_escalated "$repo" && continue
     pf="$(poll_file "$repo")"
     [[ -f "$pf" ]] || continue
-    IFS=$'\t' read -r mstate status sig < "$pf"
+    IFS=$'\t' read -r mstate status drift sig < "$pf"
     [[ "$status" == "RED" && "$mstate" == "OPEN" ]] || continue
     # RED but no parsed signature (an exotic check conclusion) — still
     # actionable; give the caches a deterministic key.
