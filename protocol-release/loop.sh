@@ -120,14 +120,18 @@ LESSONS="$SCRIPT_DIR/lessons.md"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-4-8}"
 REVIEWER_MODEL="${REVIEWER_MODEL:-gpt-5.5}"
 # Per-repo claude reasoning effort. Most repos use DEFAULT_EFFORT; the heavy
-# reasoning repos in MAX_EFFORT_REPOS use 'max'. Passed to `claude --effort`,
-# which overrides any inherited CLAUDE_EFFORT/settings default.
+# reasoning repos in MAX_EFFORT_REPOS use MAX_EFFORT. Passed to
+# `claude --effort`, which overrides any inherited CLAUDE_EFFORT/settings
+# default.
 DEFAULT_EFFORT="${DEFAULT_EFFORT:-high}"
 MAX_EFFORT_REPOS="${MAX_EFFORT_REPOS:-rs-soroban-env stellar-core}"
-# Effort for the heavy-reasoning repos in MAX_EFFORT_REPOS. Was 'max'; 'xhigh'
-# is a large cost cut with modest quality loss on the two hardest repos.
+# Effort for the heavy-reasoning repos in MAX_EFFORT_REPOS. History: 'max' →
+# 'xhigh' → 'high': the July 2026 refresh run showed xhigh merge reasoning on
+# env/core dominating spend (~70% of the bill) for mostly-mechanical work.
+# Raise per-run (MAX_EFFORT=xhigh ./loop.sh …) for from-scratch CAP
+# implementation on the hardest repos.
 MAX_EFFORT="${MAX_EFFORT:-high}"
-REPO_EFFORT="$DEFAULT_EFFORT"    # current repo's effort; reset per repo below
+REPO_EFFORT="$DEFAULT_EFFORT"   # current repo's effort; reset per repo below
 MAX_WATCH_ITERS="${MAX_WATCH_ITERS:-60}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-120}"
 # Cap on plan-revise rounds inside plan_then_review. Default 1: a single
