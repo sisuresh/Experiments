@@ -648,7 +648,7 @@ echo "<xdr from response>" | stellar xdr decode --type LedgerEntryData
 
 ### Docker disk space
 
-The quickstart container needs disk space for PostgreSQL initialization. If the container exits immediately on startup, check `docker logs` — "No space left on device" during `initdb` means Docker's disk is full. Run `docker system prune` to reclaim space from old containers and images.
+The quickstart container needs disk space for PostgreSQL initialization. If the container exits immediately on startup, check `docker logs` — "No space left on device" during `initdb` means Docker's disk is full. Ask the user to clear up disk space.
 
 ## Quick Reference
 
