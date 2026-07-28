@@ -2,7 +2,8 @@
 path: ~/dev/stellar-rpc
 base: protocol-next
 group: leaf
-plan_model: opus
+plan_model: sonnet
+plan_effort: medium
 impl_model: sonnet
 ---
 Stellar RPC. Base branch is `protocol-next`, NOT main.

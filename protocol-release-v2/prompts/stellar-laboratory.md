@@ -2,7 +2,8 @@
 path: ~/dev/stellar-laboratory
 base: main
 group: leaf
-plan_model: opus
+plan_model: sonnet
+plan_effort: medium
 impl_model: sonnet
 ---
 Laboratory UI (repo is stellar/laboratory). Repin the JS SDK / xdr-json deps to

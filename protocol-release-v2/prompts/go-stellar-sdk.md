@@ -2,7 +2,8 @@
 path: ~/dev/go-stellar-sdk
 base: protocol-next
 group: leaf
-plan_model: opus
+plan_model: sonnet
+plan_effort: medium
 impl_model: sonnet
 ---
 Go SDK. Base branch is `protocol-next`, NOT main.

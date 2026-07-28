@@ -15,16 +15,22 @@ import argparse
 import asyncio
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from lib import (
+    EFFORTS,
+    MODELS,
     Handoff,
     Repo,
+    base_sha,
     chain_context,
+    load_plans,
     load_repo,
     load_state,
     read_base,
     run_agent,
+    save_plan,
     save_state,
     say,
 )
@@ -99,18 +105,52 @@ the pins you set and any decision a downstream repo must mirror."""
 
 
 async def author_repo(r: Repo, ctx: dict) -> Handoff | None:
-    plan = await run_agent(
-        label=f"plan:{r.name}",
-        prompt=plan_prompt(r, ctx["release"], ctx["base"], chain_context(ctx["order"], ctx["state"])),
-        cwd=r.path, model=r.plan_model, effort=r.plan_effort, write=False, max_turns=60,
-    )
-    if not plan.ok:
-        say(f"✗ {r.name}: planning failed ({plan.subtype}) — skipping")
-        return None
+    plan_session: str | None = None
+    plan_text = ""
+
+    # Reuse a saved plan session when one exists and the base hasn't moved
+    # under it — that skips the expensive exploration entirely.
+    if ctx["reuse_plans"]:
+        saved = ctx["plans"].get(r.name)
+        if saved and saved.get("session_id"):
+            now = base_sha(r.path, r.base)
+            was = saved.get("base_sha")
+            if now and now == was:
+                say(f"↻ {r.name}: reusing plan from {saved.get('at', '?')} "
+                    f"(session {saved['session_id'][:8]}, base unchanged)")
+                plan_session, plan_text = saved["session_id"], saved.get("plan", "")
+            else:
+                say(f"↻ {r.name}: saved plan is stale (base {str(was)[:8]} → "
+                    f"{str(now)[:8]}) — re-planning")
+
+    if not plan_session:
+        plan = await run_agent(
+            label=f"plan:{r.name}",
+            prompt=plan_prompt(r, ctx["release"], ctx["base"],
+                               chain_context(ctx["order"], ctx["state"])),
+            cwd=r.path, model=r.plan_model, effort=r.plan_effort, write=False, max_turns=60,
+        )
+        if not plan.ok:
+            say(f"✗ {r.name}: planning failed ({plan.subtype}) — skipping")
+            return None
+        plan_session, plan_text = plan.session_id, plan.text
+        # Save it even on a plan-only run: that is exactly the case where the
+        # exploration would otherwise be thrown away.
+        if plan_session:
+            save_plan(ctx["release_id"], r.name, {
+                "session_id": plan_session,
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "base_sha": base_sha(r.path, r.base),
+                "model": r.plan_model, "effort": r.plan_effort,
+                "cost_usd": round(plan.cost_usd, 4), "turns": plan.turns,
+                "plan": plan_text,
+            })
+            say(f"   saved plan session {plan_session[:8]} for reuse "
+                f"(--reuse-plans)")
 
     if ctx["plan_only"]:
         say(f"— {r.name}: plan-only, not implementing")
-        print(f"\n──── PLAN: {r.name} ────\n{plan.text}\n", flush=True)
+        print(f"\n──── PLAN: {r.name} ────\n{plan_text}\n", flush=True)
         return None
 
     # Context reuse: resume the planner's session so the implementer inherits
@@ -118,7 +158,7 @@ async def author_repo(r: Repo, ctx: dict) -> Handoff | None:
     impl = await run_agent(
         label=f"impl:{r.name}", prompt=impl_prompt(r), cwd=r.path,
         model=r.impl_model, effort=r.impl_effort, write=True,
-        resume=plan.session_id, schema=HANDOFF_SCHEMA, max_turns=150,
+        resume=plan_session, schema=HANDOFF_SCHEMA, max_turns=150,
     )
     if not impl.ok:
         say(f"✗ {r.name}: implementation failed ({impl.subtype})")
@@ -145,6 +185,13 @@ async def main() -> None:
     ap.add_argument("--print-prompt", action="store_true",
                     help="print the exact prompts that would be sent, then exit "
                          "(no model calls, no logs, costs nothing)")
+    ap.add_argument("--reuse-plans", action="store_true",
+                    help="reuse saved plan sessions from an earlier run instead of "
+                         "re-planning; stale plans (base branch moved) are re-planned")
+    ap.add_argument("--plan-model", choices=list(MODELS), help="override every repo's plan model")
+    ap.add_argument("--plan-effort", choices=EFFORTS, help="override every repo's plan effort")
+    ap.add_argument("--impl-model", choices=list(MODELS), help="override every repo's impl model")
+    ap.add_argument("--impl-effort", choices=EFFORTS, help="override every repo's impl effort")
     a = ap.parse_args()
 
     release = Path(a.release_file).read_text()
@@ -154,6 +201,11 @@ async def main() -> None:
         sys.exit(f'no "## Targets" list found in {a.release_file}')
 
     repos = [load_repo(n) for n in order]
+    for r in repos:   # CLI overrides beat per-repo frontmatter
+        r.plan_model = a.plan_model or r.plan_model
+        r.plan_effort = a.plan_effort or r.plan_effort
+        r.impl_model = a.impl_model or r.impl_model
+        r.impl_effort = a.impl_effort or r.impl_effort
     if a.only:
         want = [n.strip() for n in a.only.split(",") if n.strip()]
         unknown = [n for n in want if n not in order]
@@ -171,6 +223,7 @@ async def main() -> None:
         "release": release, "release_id": release_id, "order": order,
         "base": read_base(), "state": load_state(release_id),
         "plan_only": a.plan_only or not a.write,
+        "reuse_plans": a.reuse_plans, "plans": load_plans(release_id),
     }
 
     # Inspect what the agents would actually receive. Deliberately placed before

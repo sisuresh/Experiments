@@ -2,7 +2,8 @@
 path: ~/dev/js-stellar-xdr-json
 base: main
 group: leaf
-plan_model: opus
+plan_model: sonnet
+plan_effort: medium
 impl_model: sonnet
 ---
 WASM XDR-to-JSON bridge. Repin the Rust XDR dep to this run's rs-stellar-xdr

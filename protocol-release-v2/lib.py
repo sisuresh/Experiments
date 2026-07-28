@@ -29,6 +29,7 @@ MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 READ_TOOLS = ["Read", "Glob", "Grep", "Bash", "WebFetch"]
 WRITE_TOOLS = READ_TOOLS + ["Edit", "Write", "MultiEdit", "NotebookEdit"]
@@ -107,6 +108,44 @@ def save_state(release_id: str, state: State) -> None:
     f = _state_file(release_id)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(state, indent=2) + "\n")
+
+
+# ------------------------------------------------------- saved plan sessions
+# A plan run is the expensive half (deep repo exploration), and its session is
+# the asset — an implementer that resumes it inherits the exploration instead
+# of paying to redo it. Persist the session id so a later --write run can pick
+# up where planning stopped rather than re-planning from zero.
+def _plans_file(release_id: str) -> Path:
+    return ROOT / "state" / f"{release_id}.plans.json"
+
+
+def load_plans(release_id: str) -> dict[str, dict]:
+    f = _plans_file(release_id)
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def save_plan(release_id: str, repo_name: str, entry: dict) -> None:
+    f = _plans_file(release_id)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    all_plans = load_plans(release_id)
+    all_plans[repo_name] = entry
+    f.write_text(json.dumps(all_plans, indent=2) + "\n")
+
+
+def git_out(repo: Path, *args: str) -> str | None:
+    import subprocess
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def base_sha(repo: Path, base: str) -> str | None:
+    """Current tip of the base branch, used to decide whether a saved plan has
+    gone stale. Fetches first so the comparison is against reality, not a
+    possibly-ancient remote-tracking ref."""
+    remotes = (git_out(repo, "remote") or "").split()
+    remote = "upstream" if "upstream" in remotes else "origin"
+    git_out(repo, "fetch", "--quiet", remote, base)
+    return git_out(repo, "rev-parse", f"{remote}/{base}")
 
 
 def chain_context(order: list[str], state: State) -> str:

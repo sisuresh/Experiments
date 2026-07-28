@@ -2,7 +2,8 @@
 path: ~/dev/docker-stellar-core-horizon
 base: master
 group: leaf
-plan_model: opus
+plan_model: sonnet
+plan_effort: medium
 impl_model: sonnet
 ---
 Quickstart image (repo is stellar/quickstart). Confirm the default branch.
