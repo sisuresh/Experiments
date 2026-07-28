@@ -142,6 +142,9 @@ async def main() -> None:
     ap.add_argument("--from", dest="from_", help="start at this repo, continue down the chain")
     ap.add_argument("--write", action="store_true", help="actually edit, build, push, open PRs")
     ap.add_argument("--plan-only", action="store_true", help="force dry even with --write")
+    ap.add_argument("--print-prompt", action="store_true",
+                    help="print the exact prompts that would be sent, then exit "
+                         "(no model calls, no logs, costs nothing)")
     a = ap.parse_args()
 
     release = Path(a.release_file).read_text()
@@ -169,6 +172,23 @@ async def main() -> None:
         "base": read_base(), "state": load_state(release_id),
         "plan_only": a.plan_only or not a.write,
     }
+
+    # Inspect what the agents would actually receive. Deliberately placed before
+    # the first say() so it creates no log directory and touches nothing.
+    if a.print_prompt:
+        chain = chain_context(order, ctx["state"])
+        for r in repos:
+            p = plan_prompt(r, release, ctx["base"], chain)
+            i = impl_prompt(r)
+            print("=" * 78)
+            print(f"# {r.name}  [{r.group}]  "
+                  f"{r.plan_model}/{r.plan_effort} → {r.impl_model}/{r.impl_effort}")
+            print(f"# cwd: {r.path}   base: {r.base}")
+            print("=" * 78)
+            print(f"\n----- PLAN PROMPT ({len(p)} chars, read-only tools) -----\n{p}")
+            print(f"\n----- IMPL PROMPT ({len(i)} chars, sent into the resumed "
+                  f"plan session) -----\n{i}\n")
+        return
 
     spine = [r for r in repos if r.group == "spine"]
     leaves = [r for r in repos if r.group == "leaf"]
