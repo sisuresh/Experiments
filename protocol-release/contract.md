@@ -363,6 +363,34 @@ The actual implementation lives at
 Each downstream PR's description should reference its direct upstream(s).
 Reviewers (and future LLM runs) navigate the chain that way.
 
+### Output style (code comments + PR descriptions)
+
+Default to LESS. These runs use high-effort models told to be thorough,
+which biases toward over-documenting — actively counteract that.
+
+**Code comments.** Match the surrounding file's existing comment density;
+a protocol change is not licence to comment more than the code around it.
+
+- Explain **why**, never **what**. Delete any comment that restates the
+  code next to it.
+- CAP / protocol rationale ("under next this widens because…", "CAP-XXXX
+  requires…") belongs in the **PR description or commit message, not
+  inline**. The only inline exception is a comment that prevents a
+  concrete future footgun in the code itself (e.g. "keep this arm before
+  X or dispatch desyncs").
+- No commented-out code, no changelog narration in comments.
+
+**PR descriptions.** Hard cap: **≤10 lines.** Exactly:
+
+- `## Changes` — bullets, what landed (one line each).
+- `## Deferred` — bullets, what's not in this PR and why (one line each);
+  omit the heading if nothing is deferred.
+- Upstream / Downstream cross-links.
+
+No narrative analysis, no inline diffs, no restatement of the plan, no
+per-file walkthrough. If a decision needs more than one line to justify,
+it needs a review comment or a design doc, not the PR body.
+
 ### When CAPs get dropped from a release
 
 If a CAP is removed mid-flight:

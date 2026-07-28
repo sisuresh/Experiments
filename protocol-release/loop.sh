@@ -877,10 +877,10 @@ OPERATING MODE (do not deviate):
   Inspect the diff; if a tx changed that you did NOT expect, note it in the
   PR for the reviewer — but still commit and continue, don't block.
 
-PR DESCRIPTION STYLE: keep it short — ideally under 15 lines. Bulleted
-'## Changes' (what landed) + '## Deferred' (what's not in this PR and
-why, one line each) + 'Upstream' / 'Downstream' cross-links. No
-narrative analysis, no inline diffs, no restatement of the plan.
+OUTPUT STYLE: follow the contract's "Output style" section exactly —
+sparse code comments (why-not-what, match surrounding density, CAP
+rationale goes in the PR body not inline) and a PR description ≤10 lines
+(## Changes / ## Deferred bullets + cross-links, no narrative).
 
 Open PRs in this run:
 $(open_prs_context)
@@ -1497,9 +1497,10 @@ branch, push to your fork, and open a draft PR AGAINST THE UPSTREAM repo
 <fork-owner>:<branch>\`) — never fork-internal, never a synthetic base.
 Cross-link the open PRs in the description.
 
-PR DESCRIPTION STYLE (for any NEW PR you open here): keep it short,
-under 15 lines. '## Changes' / '## Deferred' bullets + upstream /
-downstream cross-links. No narrative analysis or inline diffs.
+OUTPUT STYLE (for any NEW PR you open here, and any code you touch):
+follow the contract's "Output style" section — sparse comments
+(why-not-what, CAP rationale in the PR body not inline) and a PR
+description ≤10 lines (## Changes / ## Deferred bullets + cross-links).
 
 Output every PR URL you touched or opened, one per line, on the last
 lines of your reply.
