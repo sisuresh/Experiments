@@ -214,6 +214,7 @@ async def run_agent(
     resume: str | None = None,
     max_turns: int = 120,
     max_budget_usd: float | None = None,
+    write_mode: str = "auto",
 ) -> RunResult:
     log = log_path(label)
     model_id = MODELS[model]
@@ -223,7 +224,7 @@ async def run_agent(
             fh.write(s)
 
     say(f"▶ {label} ({model_id}/{effort}{', resumed' if resume else ''}"
-        f"{'' if write else ', read-only'}) → {log}")
+        f"{', ' + write_mode if write else ', read-only'}) → {log}")
     w(f"### {label}\ncwd: {cwd}\nmodel: {model_id} effort={effort}\n"
       f"resume: {resume or '(new)'}\n\n--- PROMPT ---\n{prompt}\n\n--- TRANSCRIPT ---\n")
 
@@ -233,9 +234,13 @@ async def run_agent(
         effort=effort,
         allowed_tools=WRITE_TOOLS if write else READ_TOOLS,
         # A headless release driver has to edit, build and push with nobody at
-        # the keyboard. Writes are confined to one checkout per agent and gated
-        # on --write at the CLI; dry runs never reach this branch.
-        permission_mode="bypassPermissions" if write else "dontAsk",
+        # the keyboard, so writes cannot use a prompting mode. 'auto' has a
+        # model classifier approve or deny each tool call, which keeps a
+        # judgment layer over destructive commands that 'bypassPermissions'
+        # (approves everything, and shadows can_use_tool entirely) would not.
+        # If the classifier starts refusing legitimate pushes, fall back with
+        # --permission-mode bypassPermissions. Dry runs never reach this branch.
+        permission_mode=write_mode if write else "dontAsk",
         setting_sources=["project"],   # pick up the repo's own CLAUDE.md
         max_turns=max_turns,
     )

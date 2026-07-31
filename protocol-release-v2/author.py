@@ -159,6 +159,7 @@ async def author_repo(r: Repo, ctx: dict) -> Handoff | None:
         label=f"impl:{r.name}", prompt=impl_prompt(r), cwd=r.path,
         model=r.impl_model, effort=r.impl_effort, write=True,
         resume=plan_session, schema=HANDOFF_SCHEMA, max_turns=150,
+        write_mode=ctx["write_mode"],
     )
     if not impl.ok:
         say(f"✗ {r.name}: implementation failed ({impl.subtype})")
@@ -192,6 +193,11 @@ async def main() -> None:
     ap.add_argument("--plan-effort", choices=EFFORTS, help="override every repo's plan effort")
     ap.add_argument("--impl-model", choices=list(MODELS), help="override every repo's impl model")
     ap.add_argument("--impl-effort", choices=EFFORTS, help="override every repo's impl effort")
+    ap.add_argument("--permission-mode", choices=["auto", "bypassPermissions"], default="auto",
+                    help="how write agents are gated: 'auto' (default) has a model "
+                         "classifier approve/deny each tool call; 'bypassPermissions' "
+                         "approves everything — fallback if the classifier blocks "
+                         "legitimate pushes")
     a = ap.parse_args()
 
     release = Path(a.release_file).read_text()
@@ -224,6 +230,7 @@ async def main() -> None:
         "base": read_base(), "state": load_state(release_id),
         "plan_only": a.plan_only or not a.write,
         "reuse_plans": a.reuse_plans, "plans": load_plans(release_id),
+        "write_mode": a.permission_mode,
     }
 
     # Inspect what the agents would actually receive. Deliberately placed before
