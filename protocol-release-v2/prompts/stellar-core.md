@@ -7,19 +7,50 @@ impl_model: opus
 plan_effort: xhigh
 impl_effort: high
 ---
-C++ validator. Base branch is `master` (not main). Slow build; hard repo.
+C++ validator. Base branch is `master` (not main). Slowest, highest-risk repo.
 
-- Repin the Rust deps in `src/rust/Cargo.toml` to this run's heads; regenerate
-  `Cargo.lock`. Keep the version constraint consistent with what the host
-  self-reports.
-- The p28 max-protocol bump may already be in from earlier CAP work. **Do not
-  duplicate it** — gate new behavior behind the existing protocol constant in
-  `src/util/ProtocolVersion.h`.
-- Watch for merge artifacts the merge tool won't flag as conflicts — e.g. a
-  duplicated `mod p28` / `use ...p28` block after merging master. Build to find them.
-- Re-recording `test-tx-meta-baseline-*` is expected when the CAP changes tx
-  semantics. Inspect the diff; if a tx changed that you did NOT expect, call it
-  out in the PR for a human, but still commit and continue.
-- CI enforces clang-format: run `make format` before pushing.
-- Build with `make -j12`. If sccache errors with "Operation not permitted",
-  stop the sccache server or unset RUSTC_WRAPPER and rebuild.
+### Per-protocol soroban submodule — CREATE `p<N>`, never bump `p<N-1>`
+Core embeds a *separate* rs-soroban-env submodule per protocol
+(`src/rust/soroban/p21`…`p<N-1>`) so old protocols keep replaying against their
+original host. For protocol N: **create a new `src/rust/soroban/p<N>`** at the
+CAP host commit, add its `.gitmodules` entry, and wire it into `Makefile.am`
+multi-soroban linking mirroring `p<N-1>`. **Never touch the previous
+protocol's submodule** — that targets the wrong protocol AND mutates released
+behavior. Learn the add-pattern from `git log --oneline -- 'src/rust/soroban/p*'`.
+
+### Protocol gating
+- `Config::CURRENT_LEDGER_PROTOCOL_VERSION` in `src/main/Config.cpp`; named
+  constants in `src/util/ProtocolVersion.h`. Gate CAP code with
+  `protocolVersionStartsFrom(ledgerVersion, <X>_PROTOCOL_VERSION)`.
+- A p28 bump may already be in from earlier CAP work — **do not duplicate it**.
+
+### Build
+- Configure next-protocol paths with
+  `./configure --enable-next-protocol-version-unsafe-for-production`.
+- **`make -j$(nproc)` — never bare `make -j`.** Unbounded `-j` spawns hundreds
+  of compilers across the multi-version Rust soroban and hangs the machine.
+- **Build INCREMENTALLY. Never `make clean` or a fresh build dir** — the
+  in-tree build plus ccache turns a small edit into minutes instead of an hour.
+- **`make format` before pushing** — CI enforces clang-format.
+- If sccache errors "Operation not permitted", stop the sccache server or unset
+  `RUSTC_WRAPPER` and rebuild.
+
+### TxMeta baseline
+CI checks committed `test-tx-meta-baseline-{current,next}`; a CAP that changes
+tx semantics fails it by design. Re-record with
+`stellar-core test [tx] --all-versions --rng-seed 12345 --record-test-tx-meta test-tx-meta-baseline-next`
+(`-next` needs the vnext configure flag) and commit. Inspect the diff; if a tx
+changed that you did NOT expect, flag it in the PR — but still commit and continue.
+
+### Opening the PR
+This checkout has ~14 remotes, which breaks `gh pr create`'s head/base
+auto-resolution and yields a spurious `403`. **A 403 here is a resolution
+artifact, not a permissions block.** Always use the explicit form:
+`gh pr create -R stellar/stellar-core --base master --head <fork-owner>:<branch> --draft`
+(or set `GH_REPO=stellar/stellar-core`). **If it still fails, ESCALATE** — push
+the branch and report the failing command. Never fall back to a fork-internal
+PR or a synthetic base branch; those are invisible to upstream CI and reviewers.
+
+### Downstream handoff
+The `-vnext` deb + docker image comes from a manual Jenkins build *after* this
+merges; horizon/rpc/quickstart legs block until it publishes.
