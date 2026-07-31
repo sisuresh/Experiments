@@ -13,6 +13,7 @@ parallel prototype.
 
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt   # once
+export REPO_ROOT=~/dev        # where your stellar checkouts live (this is the default)
 
 # Dry run (default): plan only, read-only tools, nothing written or pushed.
 ./.venv/bin/python author.py releases/p28-cap-0084.md --only rs-stellar-xdr
@@ -26,7 +27,15 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt   # once
 Flags: `--only <repo>` one repo · `--from <repo>` resume mid-chain ·
 `--write` actually change things · `--plan-only` force dry even with `--write`.
 
-Auth uses your existing Claude Code login — no `ANTHROPIC_API_KEY` needed.
+Auth uses your existing Claude Code login — no `ANTHROPIC_API_KEY` needed (set
+that env var if you'd rather it ran on an API key).
+
+**Portability.** Prompt frontmatter refers to `$REPO_ROOT/<repo>`, so nothing
+here is tied to one machine's layout. Point `REPO_ROOT` at your checkouts, or
+override a single repo's `path:` in its `prompts/<repo>.md`. A missing checkout
+fails immediately with the expected path rather than mid-run. The prompts also
+avoid assuming remote names — agents are told to inspect `git remote -v` to find
+the canonical `stellar/<repo>` rather than assuming it is `upstream`.
 
 ## The three ideas
 

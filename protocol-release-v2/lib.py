@@ -23,6 +23,11 @@ from claude_agent_sdk import (
 
 ROOT = Path(__file__).resolve().parent
 
+# Where the target repos are checked out. Prompt frontmatter refers to
+# $REPO_ROOT so the prompts stay portable between machines; override the env
+# var if your checkouts live somewhere other than ~/dev.
+os.environ.setdefault("REPO_ROOT", str(Path.home() / "dev"))
+
 MODELS = {
     "opus": "claude-opus-5",
     "sonnet": "claude-sonnet-5",
@@ -73,7 +78,7 @@ def load_repo(name: str) -> Repo:
 
     return Repo(
         name=name,
-        path=Path(os.path.expanduser(need("path"))),
+        path=Path(os.path.expanduser(os.path.expandvars(need("path")))),
         base=need("base"),
         group="spine" if need("group") == "spine" else "leaf",
         plan_model=fm.get("plan_model", "opus"),

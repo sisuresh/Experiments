@@ -1,5 +1,5 @@
 ---
-path: ~/dev/go-stellar-sdk
+path: $REPO_ROOT/go-stellar-sdk
 base: protocol-next
 group: leaf
 plan_model: sonnet

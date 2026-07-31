@@ -1,5 +1,5 @@
 ---
-path: ~/dev/stellar-xdr
+path: $REPO_ROOT/stellar-xdr
 base: main
 group: spine
 plan_model: opus
@@ -25,7 +25,8 @@ Canonical XDR definitions — the single source for every other repo.
   goes in that one shared commit and every consumer re-pins. Never author a side
   `.x` on a fork, and never repoint core's submodule at one — it diverges C++
   from Rust and fails core's byte-level `XDR_FILES_SHA256`.
-- If the checkout is missing: `git clone https://github.com/stellar/stellar-xdr ~/dev/stellar-xdr`.
+- If the checkout is missing, clone it to the path above:
+  `git clone https://github.com/stellar/stellar-xdr "$REPO_ROOT/stellar-xdr"`.
 - `stellar-xdr xfile preprocess --features CAP_<n>,...` is the canonical way to
   resolve `#ifdef` before any non-Rust codegen (`goxdr` and Ruby `xdrgen` both
   choke on `#`).

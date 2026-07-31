@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import sys
 from datetime import datetime
@@ -224,6 +225,18 @@ async def main() -> None:
             repos = repos[names.index(a.from_):]
     if not repos:
         sys.exit("no repos selected")
+
+    # Fail early and legibly when checkouts aren't where the prompts expect —
+    # the common case for someone running this on a different machine.
+    missing = [r for r in repos if not (r.path / ".git").is_dir()]
+    if missing:
+        sys.exit(
+            "no git checkout found for:\n"
+            + "\n".join(f"  {r.name:<28} {r.path}" for r in missing)
+            + f"\n\nREPO_ROOT is currently {os.environ['REPO_ROOT']!r}. Set it to where your"
+            "\ncheckouts live (e.g. REPO_ROOT=~/src), or override a single repo's"
+            "\n'path:' in its prompts/<repo>.md frontmatter."
+        )
 
     ctx = {
         "release": release, "release_id": release_id, "order": order,

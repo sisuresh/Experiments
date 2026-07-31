@@ -1,5 +1,5 @@
 ---
-path: ~/dev/stellar-laboratory
+path: $REPO_ROOT/stellar-laboratory
 base: main
 group: leaf
 plan_model: sonnet

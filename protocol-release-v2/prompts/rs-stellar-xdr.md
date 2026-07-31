@@ -1,5 +1,5 @@
 ---
-path: ~/dev/rs-stellar-xdr
+path: $REPO_ROOT/rs-stellar-xdr
 base: main
 group: spine
 plan_model: opus

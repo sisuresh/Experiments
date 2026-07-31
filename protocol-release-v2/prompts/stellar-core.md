@@ -1,5 +1,5 @@
 ---
-path: ~/dev/stellar-core
+path: $REPO_ROOT/stellar-core
 base: master
 group: spine
 plan_model: opus
@@ -32,8 +32,9 @@ behavior. Learn the add-pattern from `git log --oneline -- 'src/rust/soroban/p*'
 - **Build INCREMENTALLY. Never `make clean` or a fresh build dir** — the
   in-tree build plus ccache turns a small edit into minutes instead of an hour.
 - **`make format` before pushing** — CI enforces clang-format.
-- If sccache errors "Operation not permitted", stop the sccache server or unset
-  `RUSTC_WRAPPER` and rebuild.
+- If a compiler-cache wrapper (e.g. sccache via `RUSTC_WRAPPER`) fails to
+  spawn, stop its server or unset the variable and rebuild — it is a local
+  tooling problem, not a code failure.
 
 ### TxMeta baseline
 CI checks committed `test-tx-meta-baseline-{current,next}`; a CAP that changes
@@ -43,9 +44,11 @@ tx semantics fails it by design. Re-record with
 changed that you did NOT expect, flag it in the PR — but still commit and continue.
 
 ### Opening the PR
-This checkout has ~14 remotes, which breaks `gh pr create`'s head/base
-auto-resolution and yields a spurious `403`. **A 403 here is a resolution
-artifact, not a permissions block.** Always use the explicit form:
+Core checkouts often accumulate many remotes (one per collaborator), which
+breaks `gh pr create`'s head/base auto-resolution and yields a spurious `403`.
+**A 403 here is a resolution artifact, not a permissions block** — the same
+token opens cross-fork PRs on the other repos in the same run. Always use the
+explicit form:
 `gh pr create -R stellar/stellar-core --base master --head <fork-owner>:<branch> --draft`
 (or set `GH_REPO=stellar/stellar-core`). **If it still fails, ESCALATE** — push
 the branch and report the failing command. Never fall back to a fork-internal

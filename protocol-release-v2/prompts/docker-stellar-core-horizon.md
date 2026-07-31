@@ -1,5 +1,5 @@
 ---
-path: ~/dev/docker-stellar-core-horizon
+path: $REPO_ROOT/docker-stellar-core-horizon
 base: master
 group: leaf
 plan_model: sonnet

@@ -1,5 +1,5 @@
 ---
-path: ~/dev/stellar-horizon
+path: $REPO_ROOT/stellar-horizon
 base: protocol-next
 group: leaf
 plan_model: opus

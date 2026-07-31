@@ -1,5 +1,5 @@
 ---
-path: ~/dev/rs-soroban-sdk
+path: $REPO_ROOT/rs-soroban-sdk
 base: main
 group: spine
 plan_model: opus

@@ -1,5 +1,5 @@
 ---
-path: ~/dev/stellar-rpc
+path: $REPO_ROOT/stellar-rpc
 base: protocol-next
 group: leaf
 plan_model: sonnet

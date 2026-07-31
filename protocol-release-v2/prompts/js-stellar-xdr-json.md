@@ -1,5 +1,5 @@
 ---
-path: ~/dev/js-stellar-xdr-json
+path: $REPO_ROOT/js-stellar-xdr-json
 base: main
 group: leaf
 plan_model: sonnet

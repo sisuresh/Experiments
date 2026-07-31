@@ -1,5 +1,5 @@
 ---
-path: ~/dev/js-stellar-base
+path: $REPO_ROOT/js-stellar-base
 base: master
 group: leaf
 plan_model: sonnet

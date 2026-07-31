@@ -13,7 +13,9 @@ first; each downstream repo repins to its upstream's pushed head.
   branch to your fork, then
   `gh pr create -R stellar/<repo> --base <base> --head <fork-owner>:<branch>`.
   Never a fork-internal PR, never a synthetic base branch to fake a clean diff.
-- Start from a fresh base: fetch upstream, branch off the latest base. If the
+- Start from a fresh base: check `git remote -v` to see which remote is the
+  canonical `stellar/<repo>` (it is commonly `upstream` when `origin` is a fork,
+  but do not assume), fetch it, and branch off the latest base. If the
   release branch exists locally from a prior run but has no PR, recreate it.
 - **Never rebase or force-push a branch that is already pushed.** To bring it
   current, merge the base in. History on a published PR branch is append-only.
