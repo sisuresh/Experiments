@@ -2,9 +2,10 @@
 path: $REPO_ROOT/go-stellar-sdk
 base: protocol-next
 group: leaf
-plan_model: sonnet
-plan_effort: medium
-impl_model: sonnet
+plan_model: opus
+plan_effort: high
+impl_model: opus
+impl_effort: high
 ---
 Single Go XDR provider for stellar-rpc, stellar-horizon and galexie. Base branch
 is `protocol-next`, NOT main (basing on a release tag produces a 9-commit

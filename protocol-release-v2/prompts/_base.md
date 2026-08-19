@@ -39,6 +39,36 @@ first; each downstream repo repins to its upstream's pushed head.
 - If your repo's change requires an upstream change that isn't landed, say so
   in your plan rather than working around it locally.
 
+## What the CAP makes reachable
+
+A CAP that changes no XDR can still change what your existing code sees. Before
+concluding "no XDR change, nothing to do", answer the second question:
+
+**What data shape, encoding or event does this CAP make newly reachable — and
+does anything in this repo parse, validate or switch on it?**
+
+Answer it by reading the code that handles that shape. Grepping for the CAP
+name finds nothing: a repo that needs a change will not mention the CAP
+anywhere.
+
+The trap is that the old and new forms coexist. A CAP that changes how
+something is *written* upstream does not retire the old form — ledger history
+keeps it, and contracts built against the old SDK keep emitting it. A consumer
+therefore usually has to accept **both**, and the failure mode is silent: a
+rejected parse that drops a record rather than raising.
+
+Worked example, missed by a real run. CAP-0086 omits `Option::None` from UDT
+maps instead of binding the key to `Void`. No XDR change, nothing to
+regenerate — so the `go-stellar-sdk` planner read the Makefile, found no
+`XDR_COMMIT` to bump, and stopped. But that repo's V4 token-event parser
+rejected a `Void`-valued `to_muxed_id`, and its caller discarded events that
+failed to parse, so entire transfer events vanished from the stream. The fix
+was three lines and a test, in a repo reported as "nothing to do".
+
+"Nothing to do here" stays a legitimate and often correct answer. It just has
+to come from having read the code that would have had to change, not only the
+pins that didn't move.
+
 ## Scope
 
 - Change only what the CAP and its required propagation demand. Do not fix
