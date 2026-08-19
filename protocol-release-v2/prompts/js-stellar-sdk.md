@@ -1,6 +1,6 @@
 ---
 path: $REPO_ROOT/js-stellar-sdk
-base: master
+base: main
 group: leaf
 plan_model: sonnet
 plan_effort: medium

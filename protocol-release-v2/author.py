@@ -228,7 +228,7 @@ async def main() -> None:
 
     # Fail early and legibly when checkouts aren't where the prompts expect —
     # the common case for someone running this on a different machine.
-    missing = [r for r in repos if not (r.path / ".git").is_dir()]
+    missing = [r for r in repos if not (r.path / ".git").exists()]
     if missing:
         sys.exit(
             "no git checkout found for:\n"
