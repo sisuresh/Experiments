@@ -4,7 +4,7 @@ base: master
 group: spine
 plan_model: opus
 impl_model: opus
-plan_effort: xhigh
+plan_effort: high
 impl_effort: high
 ---
 C++ validator. Base branch is `master` (not main). Slowest, highest-risk repo.

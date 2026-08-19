@@ -4,7 +4,7 @@ base: main
 group: spine
 plan_model: opus
 impl_model: opus
-plan_effort: xhigh
+plan_effort: high
 impl_effort: high
 ---
 The Soroban host — where real semantic implementation happens. Hardest repo in
